@@ -94,7 +94,7 @@ Browser (React SPA)
 ```bash
 # Clone
 git clone https://github.com/0x5erotonin/serotonin-public.git
-cd serotonin
+cd Serotonin-public
 
 # Install
 npm install
