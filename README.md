@@ -136,14 +136,14 @@ Serotonin-public/
 
 ## 💭 Why I built this
 
-I'm a SOC analyst moving into detection engineering. I kept watching GRC work eat up analyst time that could go toward actual security work — threat hunting, tuning detections, reducing alert fatigue.
+I'm a Security Engineer moving into detection engineering. I kept watching GRC work eat up analyst time that could go towards deeper security work — threat hunting, tuning detections, reducing alert fatigue.
 
 The questionnaire problem is a perfect automation target: highly repetitive, well-defined inputs and outputs, clear quality criteria (confidence scoring), and meaningful time savings when you get it right. Building this taught me more about practical security automation than any cert has — threat modeling a real app, implementing HIPAA controls that aren't just checkboxes, designing RLS policies that actually hold up, and thinking through what "secure by default" looks like at the application layer.
 
-The full production version (with auth, domain locking, invite-only access, and Supabase connected) is running internally. This is the cleaned-up public demo.
+The full production version (with auth, domain locking, invite-only access, and Supabase connected) is not available. This is the cleaned-up public demo.
 
 ---
 
 ## 📄 License
 
-MIT — fork it, adapt it, build on it.
+
