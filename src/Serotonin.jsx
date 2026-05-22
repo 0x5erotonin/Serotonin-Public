@@ -10,7 +10,7 @@ import {
 } from 'lucide-react';
 
 // Serotonin v2.0 — Public Portfolio Demo
-// MIT License — https://github.com/YOUR_USERNAME/serotonin
+// MIT License — https://github.com/0x5erotonin/your-public-repo-name
 
 // ─── AUTO SCALE HOOK ─────────────────────────────────────────────────────────
 // Scales the entire app so it always fills the viewport correctly.
@@ -3803,7 +3803,7 @@ export default function Serotonin() {
           </span>
         </div>
         <a
-          href="https://github.com/YOUR_USERNAME/serotonin"
+          href="https://github.com/0x5erotonin/your-public-repo-name"
           target="_blank"
           rel="noreferrer"
           style={{ fontFamily: t.sansFont, fontSize: 11, fontWeight: 600, color: '#fff', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 5, opacity: 0.9 }}

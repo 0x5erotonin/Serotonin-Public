@@ -93,7 +93,7 @@ Browser (React SPA)
 
 ```bash
 # Clone
-git clone https://github.com/YOUR_USERNAME/serotonin.git
+git clone https://github.com/0x5erotonin/serotonin-public.git
 cd serotonin
 
 # Install
