@@ -1,161 +1,149 @@
-# Serotonin — GRC Questionnaire Automation Platform
+# 🧪 Serotonin
 
-> An end-to-end security questionnaire automation platform built to reduce the time GRC analysts spend on repetitive compliance work.
+**GRC questionnaire automation for security teams who have better things to do.**
 
-**Built with:** React 18 · Vite · Supabase · Vercel · Lucide Icons
+> Built because answering "do you have SOC 2?" for the 47th time shouldn't take 4 hours.
 
----
-
-## What this is
-
-Serotonin is a full-stack internal tooling project that automates the security questionnaire lifecycle for GRC (Governance, Risk, and Compliance) teams.
-
-Security teams at mid-to-large companies receive dozens of security questionnaires per year from customers, vendors, and auditors — each one asking variations of the same 40–60 questions. Answering them manually takes 3–5 hours per questionnaire. Serotonin cuts that to under 30 minutes by:
-
-- Pulling answers from a searchable knowledge base of past questionnaires
-- Auto-filling high-confidence answers and flagging uncertain ones for review
-- Tracking ownership and assignment across the team
-- Saving completed questionnaires back to the knowledge base for future reuse
+![React](https://img.shields.io/badge/React_18-20232A?style=flat&logo=react&logoColor=61DAFB)
+![Vite](https://img.shields.io/badge/Vite-646CFF?style=flat&logo=vite&logoColor=white)
+![Supabase](https://img.shields.io/badge/Supabase-3ECF8E?style=flat&logo=supabase&logoColor=white)
+![Vercel](https://img.shields.io/badge/Vercel-000000?style=flat&logo=vercel&logoColor=white)
 
 ---
 
-## Features
+## 🤔 The problem
 
-### Complete questionnaires
-Five-step workflow: import → process → review → approve → send. Supports Gmail, Google Drive, file upload (PDF/DOCX/XLSX/CSV), and manual paste. Answers are auto-filled from the knowledge base with confidence scoring. Incomplete questionnaires save as drafts and are resumable across sessions.
+Every security team knows the drill. A vendor or customer sends over a 50-question security questionnaire. Half the questions are identical to ones you answered last month. You spend 3–5 hours digging through old spreadsheets, your SOC 2 report, and Slack messages trying to remember what you wrote last time.
 
-### Knowledge base
-Every completed questionnaire is automatically indexed. Full-text search, tag filtering, expandable Q&A preview per entry. Supports importing policy documents (SOC 2 reports, access control policies, disaster recovery plans, BAAs) as reference material.
+Then it happens again next month. And the month after that.
 
-### Dashboard
-Live active assessments panel showing all in-progress drafts with owner, assignee, step, progress percentage, and last-saved timestamp. One-click resume.
-
-### Internal wiki
-16-article documentation system covering getting started, each module, data security, tips, and troubleshooting — built directly into the app.
-
-### Five themes
-Forest (warm parchment) · Chalk (clean white) · Obsidian (dark mode) · Aero (Frutiger-style gloss) · Oklou (editorial dark)
+**Serotonin is the tool I wished existed.** It remembers everything you've ever answered, auto-fills the easy ones, flags the uncertain ones for your review, and gets the whole thing out the door in under 30 minutes.
 
 ---
 
-## Technical highlights
+## ✨ What it does
 
-```
-Frontend          React 18 + Vite, zero CSS framework, inline styles with a
-                  semantic token system shared across all five themes
+**📋 Complete questionnaires** — Import from Gmail, Google Drive, file upload, or paste directly. Serotonin searches your answer history and auto-fills with confidence scoring. High confidence = auto-filled. Low confidence = flagged for you to check. Five-step workflow: import → process → review → approve → send.
 
-Auth              Supabase Auth — email/password + Google OAuth SSO
-                  Session inactivity timeout (HIPAA §164.312(a)(2)(iii))
-                  Domain allowlist enforcement at DB trigger level
+**🧠 Knowledge base** — Every questionnaire you complete gets indexed and searchable. Drop in your SOC 2 reports, access control policies, disaster recovery plans — it'll use them as source material. Gets smarter with every questionnaire you run through it.
 
-Database          Supabase Postgres with Row Level Security on all tables
-                  Audit log capturing every create/update/delete
+**📊 Dashboard** — See everything in flight at a glance. Who owns what, where it's at in the workflow, how complete it is, who it's assigned to. One click to pick up where you left off.
 
-Storage           Supabase Storage for uploaded policy documents
+**📖 Internal wiki** — Full documentation built directly into the app. 16 articles covering every feature, security posture, tips, and troubleshooting. No external Notion or Confluence required.
 
-Routing           Hash-based client-side routing (no React Router dependency)
-
-State             React useState lifted to root with sessionStorage persistence
-                  for cross-refresh questionnaire progress
-
-Security headers  HSTS · CSP · X-Frame-Options · X-Content-Type-Options ·
-                  Referrer-Policy · Permissions-Policy
-
-Hosting           Vercel (auto-deploy on git push)
-```
+**🎨 Five themes** — Forest · Chalk · Obsidian · Aero · Oklou. Yes I spent way too long on this. No I don't regret it.
 
 ---
 
-## Architecture
+## 🛠 Tech stack
+
+No UI framework. No component library. Just React, inline styles, and a semantic color token system that powers all five themes from a single set of variables.
+
+| Layer | Choice | Why |
+|---|---|---|
+| Frontend | React 18 + Vite | Fast dev loop, no framework overhead |
+| Styling | Inline styles + CSS tokens | Full theme control, zero bundle cost |
+| Auth | Supabase Auth | Email/password + Google OAuth out of the box |
+| Database | Supabase Postgres | RLS on every table, audit log, real-time |
+| Storage | Supabase Storage | Policy documents, avatars |
+| Routing | Hash-based (`#editor`, `#kb`) | No React Router dep |
+| State | `useState` + `sessionStorage` | Draft persistence without a backend |
+| Hosting | Vercel | Push to deploy, security headers via `vercel.json` |
+
+**Security stuff worth mentioning:**
+- Row Level Security on all 6 database tables — users can only ever see their own data
+- Session inactivity timeout (HIPAA §164.312(a)(2)(iii)) — auto-logout after 15 min idle
+- Domain allowlist enforced at the Postgres trigger level — can't be bypassed from the client
+- Full audit log on every create/update/delete
+- HSTS, CSP, X-Frame-Options, Referrer-Policy headers on all responses
+
+---
+
+## 🏗 Architecture
 
 ```
 Browser (React SPA)
     │
-    ├── Hash router (#editor, #vendor, #batch, #knowledge, #wiki)
-    ├── Shared state: kbEntries, kbDocs, drafts (sessionStorage backed)
-    ├── Five theme system with semantic color tokens
-    └── Supabase JS client
+    ├── Hash router  →  #dashboard · #editor · #knowledge · #wiki
+    ├── Shared state →  drafts · kbEntries · kbDocs  (sessionStorage backed)
+    ├── Theme system →  5 themes × semantic color tokens
+    └── Supabase client
             │
-            ├── auth.users          — Supabase Auth
-            ├── profiles            — extended user data
-            ├── questionnaires      — draft + completed questionnaires
-            ├── questions           — individual Q&A pairs
-            ├── documents           — attached policy files
-            ├── notifications       — real-time notification feed
-            └── audit_log           — immutable action history
+            ├── auth.users        ← Supabase Auth (email + Google OAuth)
+            ├── profiles          ← extended user data + preferences
+            ├── questionnaires    ← draft and completed assessments
+            ├── questions         ← individual Q&A pairs with confidence scores
+            ├── documents         ← attached policy files
+            ├── notifications     ← real-time notification feed
+            └── audit_log         ← immutable action history
 ```
 
 ---
 
-## Running locally
+## 🚀 Running locally
 
-**Prerequisites:** Node 18+, a Supabase project
+**You'll need:** Node 18+, and optionally a Supabase project (the demo runs without one)
 
 ```bash
-# Clone
-git clone https://github.com/0x5erotonin/serotonin-public.git
+# Clone it
+git clone https://github.com/0x5erotonin/Serotonin-public.git
 cd Serotonin-public
 
-# Install
+# Install deps
 npm install
 
-# Configure
-cp .env.example .env
-# Fill in VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY
-
-# Set up database
-# Paste docs/supabase_schema.sql into Supabase SQL Editor and run
-
-# Start dev server
+# Start the dev server — works without Supabase in demo mode
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173)
+Open [http://localhost:5173](http://localhost:5173) — the app loads directly, no login required in demo mode.
+
+**To enable auth + persistence**, connect a Supabase project:
+
+```bash
+cp .env.example .env
+# Fill in VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY
+```
+
+Then run the schema:
+```bash
+# Paste docs/supabase_schema.sql into your Supabase SQL Editor and hit Run
+# Creates 6 tables, RLS policies, storage bucket, and auth triggers
+# Takes about 5 seconds
+```
 
 ---
 
-## Database setup
-
-The full schema is in `docs/supabase_schema.sql`. It creates 6 tables with RLS policies, a storage bucket, and auth triggers. Paste it into your Supabase SQL Editor and run — takes about 5 seconds.
-
----
-
-## Configuring domain restriction (optional)
-
-To restrict signups to a specific email domain, set `ALLOWED_DOMAIN` in `public/landing.html` and add the corresponding Postgres trigger from `docs/supabase_schema.sql`.
-
----
-
-## Project structure
+## 📁 Project structure
 
 ```
-serotonin/
+Serotonin-public/
 ├── src/
-│   ├── Serotonin.jsx     — Full application (single-file React SPA)
-│   ├── main.jsx          — Entry point
+│   ├── Serotonin.jsx   ← the whole app (single-file SPA, ~3,900 lines)
+│   ├── main.jsx        ← mounts the app, no auth wrapper in demo mode
 │   └── lib/
-│       ├── supabase.js   — Client init
-│       ├── db.js         — Database layer
-│       └── useAuth.js    — Auth hook
-├── public/
-│   └── landing.html      — Sign-in page (standalone HTML)
+│       ├── supabase.js ← client init (returns null without .env)
+│       └── useAuth.js  ← auth state hook
 ├── docs/
-│   ├── supabase_schema.sql
-│   ├── PRD.md
-│   └── QUICKSTART.md
-├── vercel.json           — Security headers + routing
+│   └── supabase_schema.sql
+├── index.html
+├── vercel.json         ← security headers
 ├── .env.example
 └── package.json
 ```
 
 ---
 
-## Why I built this
+## 💭 Why I built this
 
-Security questionnaire fatigue is a real problem in GRC teams. The average enterprise security team spends 15–20% of their time answering the same questions in different formats for different customers. This project explores what a purpose-built automation layer for that workflow would look like — from the UX of the questionnaire review flow, to the knowledge base architecture, to the compliance considerations (HIPAA session timeout, audit logging, RLS).
+I'm a SOC analyst moving into detection engineering. I kept watching GRC work eat up analyst time that could go toward actual security work — threat hunting, tuning detections, reducing alert fatigue.
+
+The questionnaire problem is a perfect automation target: highly repetitive, well-defined inputs and outputs, clear quality criteria (confidence scoring), and meaningful time savings when you get it right. Building this taught me more about practical security automation than any cert has — threat modeling a real app, implementing HIPAA controls that aren't just checkboxes, designing RLS policies that actually hold up, and thinking through what "secure by default" looks like at the application layer.
+
+The full production version (with auth, domain locking, invite-only access, and Supabase connected) is running internally. This is the cleaned-up public demo.
 
 ---
 
-## License
+## 📄 License
 
-MIT — free to use, fork, and adapt.
+MIT — fork it, adapt it, build on it.
