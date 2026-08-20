@@ -1,3 +1,12 @@
+-- ⚠️  NOT USED BY THE AWS AMPLIFY DEPLOYMENT (v2.1+).
+--
+-- Persistence now runs on Amplify Gen 2: the schema of record is
+-- amplify/data/resource.ts (AppSync + DynamoDB), and files live in S3 via
+-- amplify/storage/resource.ts. See AMPLIFY_SETUP.md.
+--
+-- This file is kept only because the dormant Supabase sign-in path still
+-- references it. It is the natural thing to delete in the auth pass.
+--
 -- Serotonin — Supabase Database Schema
 -- Paste this entire file into the Supabase SQL Editor and click Run.
 -- See README.md for full setup instructions.

@@ -9,6 +9,18 @@ import {
   SkipForward, BarChart3, Lock, Circle, LogOut
 } from 'lucide-react';
 
+import { usePersistentList, usePersistentProfile, useLocalValue } from './lib/usePersisted.js';
+import { migrateLegacySessionState, recordAudit, deleteWhere } from './lib/store.js';
+import { uploadFile, removeFile, openFile, getFileUrl, formatBytes } from './lib/files.js';
+import { isAmplifyConfigured, whenReady } from './lib/amplifyClient.js';
+import { extractText, SUPPORTED_LABEL } from './lib/extract.js';
+import { extractQuestions, questionsFromLines } from './lib/questionExtract.js';
+import { autoReview } from './lib/matcher.js';
+import {
+  loadChunks, indexDocument, indexQaPairs, removeChunksFor,
+  indexCoverage, backfillIndex,
+} from './lib/kbIndex.js';
+
 // Serotonin v2.0
 // Created and Owned by Blayqe Forbes
 // Copyright © 2025 Blayqe Forbes. All Rights Reserved.
@@ -341,29 +353,59 @@ function ThemeSwitcher({ current, onChange, t }) {
 
 // ─── APPROVAL STEP ────────────────────────────────────────────────────────────
 
-function ApprovalStep({ t, s, vendor, questions, onBack, onComplete }) {
-  const [docs,        setDocs]        = useState([]);
+function ApprovalStep({ t, s, vendor, questions, onBack, onComplete, questionnaireId }) {
+  // Attachments are loaded from the store so they survive a refresh mid-approval,
+  // and each file's bytes go to S3 (or IndexedDB with no backend attached)
+  // instead of being held in a File object that dies with the page.
+  const {
+    items: allAttachments,
+    save: saveDoc,
+    remove: removeDoc,
+  } = usePersistentList('attachments');
+
+  // The collection holds every attachment this user has ever added; the
+  // approval step only cares about the one questionnaire in front of them.
+  const docs = allAttachments.filter(
+    d => String(d.questionnaireId) === String(questionnaireId),
+  );
+
   const [emailSent,   setEmailSent]   = useState(false);
   const [pdfExported, setPdfExported] = useState(false);
   const [showGate,    setShowGate]    = useState(false); // confirmation modal
+  const [uploading,   setUploading]   = useState(0);     // in-flight upload count
 
   const dispatched = emailSent || pdfExported;
 
-  const handleFileAdd = (e) => {
+  const handleFileAdd = async (e) => {
     const files = Array.from(e.target.files);
-    setDocs(prev => [...prev, ...files.map(f => ({
-      id: Date.now() + Math.random(), name: f.name, size: f.size, file: f,
-    }))]);
     e.target.value = '';
+    if (files.length === 0) return;
+    setUploading(n => n + files.length);
+    for (const file of files) {
+      try {
+        const stored = await uploadFile(file, { folder: 'attachments' });
+        saveDoc({
+          id: `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          questionnaireId,
+          name: stored.name,
+          size: stored.sizeBytes,
+          contentType: stored.contentType,
+          storagePath: stored.storagePath,
+          savedAt: new Date().toISOString(),
+        });
+      } finally {
+        setUploading(n => Math.max(0, n - 1));
+      }
+    }
   };
 
-  const handleRemove = (id) => setDocs(prev => prev.filter(d => d.id !== id));
-
-  const formatSize = (bytes) => {
-    if (bytes < 1024)        return bytes + ' B';
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  const handleRemove = (id) => {
+    const doc = docs.find(d => String(d.id) === String(id));
+    removeDoc(id);
+    if (doc?.storagePath) removeFile(doc.storagePath);
   };
+
+  const formatSize = formatBytes;
 
   const completion = questions.length > 0
     ? Math.round((questions.filter(q => q.answer?.trim()).length / questions.length) * 100)
@@ -429,7 +471,7 @@ function ApprovalStep({ t, s, vendor, questions, onBack, onComplete }) {
   // ── Mark complete — only allowed after dispatching ────────────
   const handleMarkComplete = () => {
     if (!dispatched) { setShowGate(true); return; }
-    onComplete();
+    onComplete(docs);
   };
 
   return (
@@ -505,7 +547,14 @@ function ApprovalStep({ t, s, vendor, questions, onBack, onComplete }) {
       {/* Documents */}
       <div style={{ ...s.card, padding: '18px 20px', marginBottom: 14 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-          <div style={{ ...s.label }}>Attached documents</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ ...s.label }}>Attached documents</div>
+            {uploading > 0 && (
+              <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontFamily: t.sansFont, fontSize: 10, color: t.accent }}>
+                <Activity size={10} />Uploading {uploading} file{uploading !== 1 ? 's' : ''}…
+              </span>
+            )}
+          </div>
           <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', background: t.accentBg, border: `0.5px solid ${t.accent}`, borderRadius: 6, padding: '5px 12px' }}>
             <input type="file" multiple accept=".pdf,.docx,.doc,.xlsx,.xls,.pptx,.txt,.png,.jpg" style={{ display: 'none' }} onChange={handleFileAdd} />
             <Upload size={12} color={t.accent} />
@@ -526,16 +575,28 @@ function ApprovalStep({ t, s, vendor, questions, onBack, onComplete }) {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             {docs.map(doc => (
               <div key={doc.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: t.bg, border: `0.5px solid ${t.border}`, borderRadius: 6 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
                   <FileText size={14} color={t.accent} />
-                  <div>
+                  <div style={{ minWidth: 0 }}>
                     <div style={{ fontFamily: t.sansFont, fontSize: 12, color: t.text, fontWeight: 500 }}>{doc.name}</div>
                     <div style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3 }}>{formatSize(doc.size)}</div>
                   </div>
                 </div>
-                <button onClick={() => handleRemove(doc.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.text3, padding: 4, display: 'flex' }}>
-                  <X size={13} />
-                </button>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
+                  {/* The file itself is now retrievable, so offer it. */}
+                  {doc.storagePath && (
+                    <button
+                      onClick={() => openFile(doc.storagePath, { filename: doc.name })}
+                      title="Open file"
+                      style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.accent, padding: 4, display: 'flex' }}
+                    >
+                      <Download size={13} />
+                    </button>
+                  )}
+                  <button onClick={() => handleRemove(doc.id)} title="Remove" style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.text3, padding: 4, display: 'flex' }}>
+                    <X size={13} />
+                  </button>
+                </div>
               </div>
             ))}
             <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', padding: '6px 10px' }}>
@@ -602,32 +663,109 @@ function ApprovalStep({ t, s, vendor, questions, onBack, onComplete }) {
 
 // ─── QUESTIONNAIRE EDITOR ─────────────────────────────────────────────────────
 
-function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft, onDeleteDraft, profile, resumeDraftId, onClearResume }) {
+function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft, onDeleteDraft, profile, resumeDraftId, onClearResume, onReleaseAttachments }) {
 
   // ── Load draft if resuming ─────────────────────────────────────
   const resumeDraft = resumeDraftId ? drafts.find(d => d.id === resumeDraftId) : null;
 
-  // ── Restore progress from sessionStorage or resumed draft ──────
+  // ── Restore progress from on-device scratch state or a resumed draft ──────
+  //
+  // PROGRESS_KEY moved from sessionStorage to localStorage: sessionStorage is
+  // scoped to a single tab and is discarded when that tab closes, which is why
+  // half-finished questionnaires used to disappear. This is the fast local
+  // mirror; the debounced autosave below is what puts the work on the server.
+  const PROGRESS_KEY = 'serotonin.v2.editorProgress';
+
+  const readProgress = () => {
+    try { return JSON.parse(localStorage.getItem(PROGRESS_KEY) || 'null'); }
+    catch { return null; }
+  };
+
   const saved = (() => {
     if (resumeDraft) return resumeDraft;
-    try { return JSON.parse(sessionStorage.getItem('serotonin_q_progress') || 'null'); }
-    catch { return null; }
+    return readProgress();
   })();
 
   const [step, setStepState]        = useState(saved?.step     || 'intake');
   const [vendor, setVendorState]    = useState(saved?.vendor   || '');
-  const [manualText, setManualText] = useState(saved?.manualText || '');
+  const [manualText, setManualTextState] = useState(saved?.manualText || '');
   const [questions, setQuestionsState] = useState(saved?.questions || []);
-  const [draftId]                   = useState(saved?.id || `draft_${Date.now()}`);
-  const [assignee, setAssignee]     = useState(saved?.assignee || '');
+  // Settable, because "Complete another" has to mint a fresh id — reusing the
+  // finished questionnaire's id would make the next one inherit its attachments.
+  const [draftId, setDraftId]        = useState(saved?.id || `draft_${Date.now()}`);
+  const [assignee, setAssigneeState] = useState(saved?.assignee || '');
 
-  // Wrap setters to also persist to sessionStorage
-  const persist = (patch) => {
-    try {
-      const current = JSON.parse(sessionStorage.getItem('serotonin_q_progress') || '{}');
-      sessionStorage.setItem('serotonin_q_progress', JSON.stringify({ ...current, ...patch }));
-    } catch {}
+  /**
+   * Trim a question down to what is worth persisting.
+   *
+   * Auto-review attaches a full cited passage to every question — exactly what
+   * the reviewer needs on screen, and far too much to store. A 261-question CAIQ
+   * came to 437 KB, past DynamoDB's 400 KB item limit, so every autosave failed
+   * while the UI still reported "Saved". The passage is truncated for storage and
+   * the rest of the citation kept, so after a refresh the analyst still sees
+   * which document the suggestion came from and can reopen it.
+   */
+  const SUGGESTION_STORE_CHARS = 240;
+  const trimQuestion = (q) => {
+    if (!q?.suggestion?.text) return q;
+    const passage = q.suggestion.text;
+    if (passage.length <= SUGGESTION_STORE_CHARS) return q;
+    return {
+      ...q,
+      suggestion: {
+        ...q.suggestion,
+        text: `${passage.slice(0, SUGGESTION_STORE_CHARS).trim()}…`,
+        truncated: true,
+      },
+    };
   };
+
+  /**
+   * Write the local scratch copy.
+   *
+   * Debounced, because this fires on every keystroke and the payload is the
+   * whole questionnaire: on a large one that was a ~400 KB stringify plus a
+   * synchronous localStorage write per character typed. State updates stay
+   * immediate; only the disk write coalesces.
+   */
+  const pendingPatch = useRef(null);
+  const persistTimer = useRef(null);
+
+  const flushProgress = useCallback(() => {
+    if (persistTimer.current) {
+      clearTimeout(persistTimer.current);
+      persistTimer.current = null;
+    }
+    const patch = pendingPatch.current;
+    pendingPatch.current = null;
+    if (!patch) return;
+    try {
+      const current = readProgress() || {};
+      localStorage.setItem(PROGRESS_KEY, JSON.stringify({ ...current, ...patch }));
+    } catch {
+      /* quota or private mode — the record still autosaves to the backend */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const persist = (patch) => {
+    const next = { ...(pendingPatch.current || {}), id: draftId, ...patch };
+    // Never store full cited passages in the scratch copy either.
+    if (Array.isArray(next.questions)) next.questions = next.questions.map(trimQuestion);
+    pendingPatch.current = next;
+    if (persistTimer.current) clearTimeout(persistTimer.current);
+    persistTimer.current = setTimeout(flushProgress, 300);
+  };
+
+  // A refresh or tab close never runs effect cleanup, so flush on pagehide too.
+  useEffect(() => {
+    const onHide = () => flushProgress();
+    window.addEventListener('pagehide', onHide);
+    return () => {
+      window.removeEventListener('pagehide', onHide);
+      flushProgress();
+    };
+  }, [flushProgress]);
 
   const setStep = (v)      => { setStepState(v);      persist({ step: v }); };
   const setVendor = (v)    => {
@@ -638,74 +776,221 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft
     const val = typeof v === 'function' ? v(questions) : v;
     setQuestionsState(val); persist({ questions: val });
   };
+  // Manual entry text is now persisted too — it used to be the one field that
+  // vanished on refresh even though everything around it was saved.
+  const setManualText = (v) => {
+    const val = typeof v === 'function' ? v(manualText) : v;
+    setManualTextState(val); persist({ manualText: val });
+  };
+  // Assignee was the last field still not written to the scratch copy: entered
+  // on its own at the intake step, it fell through both save paths.
+  const setAssignee = (v) => {
+    const val = typeof v === 'function' ? v(assignee) : v;
+    setAssigneeState(val); persist({ assignee: val });
+  };
 
   // Clear saved progress when questionnaire is reset
   const clearProgress = () => {
-    sessionStorage.removeItem('serotonin_q_progress');
+    try { localStorage.removeItem(PROGRESS_KEY); } catch {}
     if (onDeleteDraft) onDeleteDraft(draftId);
+    if (onReleaseAttachments) onReleaseAttachments(draftId);
     if (onClearResume) onClearResume();
+    setDraftId(`draft_${Date.now()}`); // fresh identity, so no stale attachments
     setStepState('intake');
     setVendorState('');
-    setManualText('');
+    setAssigneeState('');
+    setManualTextState('');
     setQuestionsState([]);
   };
 
   // Save current state as a named draft
   const [draftSaved, setDraftSaved] = useState(false);
+  // Real attachment count, reported back by the approval step on completion.
+  const [attachedCount, setAttachedCount] = useState(0);
+
+  // Single source of truth for the draft payload, shared by the explicit
+  // "Save draft" button and the autosave effect below.
+  const buildDraft = () => ({
+    id:           draftId,
+    vendor:       vendor || 'Unnamed vendor',
+    step,
+    status:       step === 'complete' ? 'complete' : 'draft',
+    questions:    questions.map(trimQuestion),
+    manualText,
+    assignee,
+    owner:        profile?.name || 'You',
+    ownerInitials:(profile?.name || 'Y').split(' ').map(w => w[0]).join('').slice(0,2).toUpperCase(),
+    progress:     questions.length > 0
+      ? Math.round(questions.filter(q => q.answer?.trim()).length / questions.length * 100)
+      : 0,
+    questionCount: questions.length,
+    savedAt:      new Date().toISOString(),
+    savedAtLabel: new Date().toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }),
+  });
 
   const handleSaveDraft = () => {
-    const draft = {
-      id:           draftId,
-      vendor:       vendor || 'Unnamed vendor',
-      step,
-      questions,
-      manualText,
-      assignee,
-      owner:        profile?.name || 'You',
-      ownerInitials:(profile?.name || 'Y').split(' ').map(w => w[0]).join('').slice(0,2).toUpperCase(),
-      progress:     questions.length > 0
-        ? Math.round(questions.filter(q => q.answer?.trim()).length / questions.length * 100)
-        : 0,
-      questionCount: questions.length,
-      savedAt:      new Date().toISOString(),
-      savedAtLabel: new Date().toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }),
-    };
-    // Save to shared drafts state (shows on Dashboard)
+    const draft = buildDraft();
+    // Save to shared drafts state (shows on Dashboard, persisted to the backend)
     if (onSaveDraft) onSaveDraft(draft);
-    // Also persist locally so it survives a refresh
+    // Also keep the local scratch copy in step
     persist(draft);
     // Flash confirmation
     setDraftSaved(true);
     setTimeout(() => setDraftSaved(false), 2500);
   };
 
+  // ── Autosave ───────────────────────────────────────────────────
+  // Debounced, so a burst of typing collapses into a single write. Bails on an
+  // untouched editor so simply visiting the page cannot create a phantom draft,
+  // and on 'complete' because that path deletes the draft on purpose.
+  useEffect(() => {
+    const hasContent = questions.length > 0 || vendor.trim().length > 0 || manualText.trim().length > 0;
+    if (!hasContent || step === 'complete') return;
+    const timer = setTimeout(() => {
+      const draft = buildDraft();
+      persist(draft);
+      if (onSaveDraft) onSaveDraft(draft);
+    }, 1200);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, vendor, manualText, questions, assignee]);
+
   const [gmailPasteOpen, setGmailPasteOpen] = useState(false);
   const [gmailPasteText, setGmailPasteText] = useState('');
-  const parseQuestions = (raw) => {
-    return raw
-      .split('\n')
-      .map(l => l.trim())
-      .filter(l => l.length > 0)
-      // Strip leading numbers/letters: "1.", "1)", "a.", "Q1.", etc.
-      .map(l => l.replace(/^(Q?\d+[\.\)]\s*|[a-z][\.\)]\s*)/i, '').trim())
-      .filter(l => l.length > 0) // only remove completely empty lines
-      .map((text, i) => ({
-        id:             i + 1,
-        text,
-        answer:         '',
-        confidence:     0,
-        source:         '',
-        status:         'needs-input',
-        flagReason:     null,
-        recommendation: null,
-      }));
+  // One question per line, markers stripped. The user typed these deliberately,
+  // so unlike the upload path there is no scoring or filtering.
+  const parseQuestions = (raw) => questionsFromLines(raw);
+
+  // ── Auto-review state ────────────────────────────────────────
+  const reviewRunRef = useRef(0);                             // supersedes stale runs
+  const [parsingFile, setParsingFile] = useState(false);      // guards double uploads
+  const [reviewProgress, setReviewProgress] = useState(null); // { stage, detail }
+  const [reviewSummary, setReviewSummary]   = useState(null);
+  const [extractNotice, setExtractNotice]   = useState(null); // { kind, message }
+
+  /**
+   * Run every intake source through the same pipeline: questions in, then
+   * matched against the knowledge base before the analyst sees them.
+   *
+   * Replaces the old `setTimeout(() => setStep('review'), 2500)` — the progress
+   * shown is now real work, and a failure lands the user in the review step with
+   * unmatched questions rather than stranding them on a spinner.
+   */
+  const startProcessing = async (parsedQuestions) => {
+    // One run at a time. Choosing a second file while the first is still parsing
+    // used to start a second pipeline writing to the same state, so the review
+    // step could show run A's questions under run B's summary.
+    const runId = reviewRunRef.current + 1;
+    reviewRunRef.current = runId;
+    const isCurrent = () => reviewRunRef.current === runId;
+
+    const seeded = parsedQuestions.map((q, i) => ({
+      id:             i + 1,
+      text:           q.text ?? q,
+      answer:         q.answer ?? '',
+      confidence:     0,
+      source:         '',
+      status:         'needs-input',
+      flagReason:     null,
+      recommendation: null,
+      suggestion:     null,
+    }));
+
+    setQuestions(seeded);
+    setStep('processing');
+    setReviewProgress({ stage: 'loading', detail: 'Loading knowledge base' });
+    setReviewSummary(null);
+
+    try {
+      const chunks = await loadChunks();
+      const { questions: reviewed, summary } = await autoReview(seeded, {
+        chunks,
+        onProgress: (stage, detail) => { if (isCurrent()) setReviewProgress({ stage, detail }); },
+      });
+      // A newer run has taken over — its questions are on screen, so writing
+      // these would mix two questionnaires together.
+      if (!isCurrent()) return;
+      setQuestions(reviewed);
+      setReviewSummary(summary);
+    } catch (err) {
+      if (!isCurrent()) return;
+      console.warn('[serotonin] Auto-review failed — continuing without matches.', err);
+      setReviewSummary({
+        total: seeded.length,
+        autoFilled: 0,
+        suggested: 0,
+        needsInput: seeded.length,
+        error: err?.message || String(err),
+      });
+    } finally {
+      if (isCurrent()) {
+        setReviewProgress(null);
+        setStep('review');
+      }
+    }
   };
 
-  // ── Start processing from any source ─────────────────────────
-  const startProcessing = (parsedQuestions) => {
-    setQuestions(parsedQuestions);
-    setStep('processing');
-    setTimeout(() => setStep('review'), 2500);
+  /** Accept a suggested answer into the answer box. */
+  const acceptSuggestion = (questionId) => {
+    setQuestions(prev => prev.map(q => {
+      if (q.id !== questionId || !q.suggestion) return q;
+      return {
+        ...q,
+        answer: q.suggestion.text,
+        status: 'auto-filled',
+        source: q.suggestion.sourceType === 'qa'
+          ? `Previously answered — ${q.suggestion.sourceName}`
+          : `${q.suggestion.sourceName}${q.suggestion.page ? ` · p.${q.suggestion.page}` : ''}`,
+        flagReason: null,
+        recommendation: null,
+      };
+    }));
+  };
+
+  /**
+   * Read an uploaded questionnaire and pull the questions out of it.
+   *
+   * This is the placeholder the app used to apologise for — "questions will be
+   * extracted automatically once file parsing is connected".
+   */
+  const handleQuestionnaireUpload = async (file) => {
+    if (parsingFile) return; // a parse is already running; ignore the second pick
+    setParsingFile(true);
+    setExtractNotice({ kind: 'working', message: `Reading ${file.name}…` });
+    setVendor(prev => prev || file.name.replace(/\.[^/.]+$/, ''));
+
+    try {
+      const parsed = await extractText(file);
+      if (parsed.error) {
+        setExtractNotice({ kind: 'error', message: parsed.error });
+        return;
+      }
+
+      const { questions: found, stats } = extractQuestions(parsed.text, { sourceName: file.name });
+      if (found.length === 0) {
+        setExtractNotice({
+          kind: 'error',
+          message:
+            parsed.warnings?.[0] ||
+            `No questions found in ${file.name}. It scanned ${stats.lines} lines. If the questions are in a table, try exporting that sheet as CSV, or paste them in manually.`,
+        });
+        return;
+      }
+
+      setExtractNotice({
+        kind: 'ok',
+        message: `Found ${found.length} question${found.length !== 1 ? 's' : ''} in ${file.name}${parsed.pages.length > 1 ? ` (${parsed.pages.length} pages)` : ''}.${parsed.warnings?.length ? ` ${parsed.warnings[0]}` : ''}`,
+      });
+      await startProcessing(found);
+    } catch (err) {
+      console.warn('[serotonin] Could not read the uploaded questionnaire.', err);
+      setExtractNotice({
+        kind: 'error',
+        message: `Could not read ${file.name}: ${err?.message || err}`,
+      });
+    } finally {
+      setParsingFile(false);
+    }
   };
 
   const stepOrder = ['intake', 'processing', 'review', 'approval', 'complete'];
@@ -770,6 +1055,30 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft
           )}
           <div style={{ ...s.eyebrow, marginBottom: 6 }}>New Questionnaire</div>
           <div style={{ ...s.heroSerif, fontSize: 28, marginBottom: 28 }}>Where is the questionnaire<br /><em style={{ color: t.heroMuted }}>coming from?</em></div>
+
+          {/* Upload / parse feedback — success, failure or in progress */}
+          {extractNotice && (
+            <div style={{
+              display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 20,
+              padding: '12px 14px', borderRadius: 8,
+              background: extractNotice.kind === 'error' ? t.dangerBg : extractNotice.kind === 'ok' ? t.accentBg : t.bg3,
+              border: `0.5px solid ${extractNotice.kind === 'error' ? t.danger : extractNotice.kind === 'ok' ? t.accent : t.border}`,
+            }}>
+              {extractNotice.kind === 'error'
+                ? <AlertTriangle size={15} color={t.danger} style={{ flexShrink: 0, marginTop: 1 }} />
+                : extractNotice.kind === 'ok'
+                  ? <CheckCircle size={15} color={t.accent} style={{ flexShrink: 0, marginTop: 1 }} />
+                  : <Activity size={15} color={t.text3} style={{ flexShrink: 0, marginTop: 1 }} />}
+              <span style={{ flex: 1, fontFamily: t.sansFont, fontSize: 12, lineHeight: 1.55, color: extractNotice.kind === 'error' ? t.dangerText : extractNotice.kind === 'ok' ? t.accentText : t.text2 }}>
+                {extractNotice.message}
+              </span>
+              {extractNotice.kind !== 'working' && (
+                <button onClick={() => setExtractNotice(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.text3, padding: 0, display: 'flex', flexShrink: 0 }}>
+                  <X size={13} />
+                </button>
+              )}
+            </div>
+          )}
 
           {/* Ownership row */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 20 }}>
@@ -849,31 +1158,28 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft
 
             {/* ── Upload file — real file picker ── */}
             <label
-              style={{ background: t.bg2, border: `0.5px solid ${t.border}`, borderRadius: 8, padding: '16px', textAlign: 'left', cursor: 'pointer', display: 'flex', alignItems: 'flex-start', gap: 12 }}
+              style={{ background: t.bg2, border: `0.5px solid ${parsingFile ? t.accent : t.border}`, borderRadius: 8, padding: '16px', textAlign: 'left', cursor: parsingFile ? 'wait' : 'pointer', opacity: parsingFile ? 0.7 : 1, display: 'flex', alignItems: 'flex-start', gap: 12 }}
             >
               <input
                 type="file"
-                accept=".pdf,.docx,.doc,.xlsx,.xls,.csv"
+                accept=".pdf,.docx,.doc,.xlsx,.xls,.csv,.tsv,.txt,.md"
                 style={{ display: 'none' }}
+                disabled={parsingFile}
                 onChange={e => {
                   const file = e.target.files[0];
-                  if (!file) return;
-                  setVendor(prev => prev || file.name.replace(/\.[^/.]+$/, ''));
-                  // File accepted — placeholder question until file parsing is connected
-                  startProcessing([{
-                    id: 1,
-                    text: `Questions from uploaded file: ${file.name}`,
-                    answer: '', confidence: 0, source: file.name, status: 'needs-input',
-                    flagReason: 'File uploaded — questions will be extracted automatically once file parsing is connected.',
-                    recommendation: 'Connect a file parsing service (PDF.js, Mammoth for DOCX) to auto-extract questions.',
-                  }]);
                   e.target.value = '';
+                  if (!file) return;
+                  handleQuestionnaireUpload(file);
                 }}
               />
-              <div style={{ width: 36, height: 36, borderRadius: 8, background: t.accentBg, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}><Upload size={16} color={t.accent} /></div>
+              <div style={{ width: 36, height: 36, borderRadius: 8, background: t.accentBg, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                {parsingFile ? <Activity size={16} color={t.accent} /> : <Upload size={16} color={t.accent} />}
+              </div>
               <div>
-                <div style={{ fontFamily: t.sansFont, fontWeight: 600, fontSize: 13, color: t.text, marginBottom: 2 }}>Upload file</div>
-                <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3 }}>PDF, DOCX, XLSX, CSV</div>
+                <div style={{ fontFamily: t.sansFont, fontWeight: 600, fontSize: 13, color: t.text, marginBottom: 2 }}>
+                  {parsingFile ? 'Reading file…' : 'Upload file'}
+                </div>
+                <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3 }}>{SUPPORTED_LABEL}</div>
               </div>
             </label>
 
@@ -983,8 +1289,18 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft
       {step === 'processing' && (
         <div style={{ textAlign: 'center', padding: '40px 0' }}>
           <div style={{ width: 64, height: 64, borderRadius: '50%', background: t.accentBg, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 20px' }}><Brain size={28} color={t.accent} /></div>
-          <div style={{ ...s.heroSerif, fontSize: 26, marginBottom: 8 }}>Processing questionnaire…</div>
-          <div style={{ fontFamily: t.sansFont, fontSize: 13, color: t.text3, marginBottom: 32 }}>Searching Vanta, Google Drive, and knowledge base</div>
+          <div style={{ ...s.heroSerif, fontSize: 26, marginBottom: 8 }}>Reviewing questionnaire…</div>
+          {/* Real stages now, not a fixed delay: load index → embed → match. */}
+          <div style={{ fontFamily: t.sansFont, fontSize: 13, color: t.text3, marginBottom: 8 }}>
+            {reviewProgress?.detail || 'Matching against your knowledge base'}
+          </div>
+          <div style={{ fontFamily: t.monoFont, fontSize: 10, letterSpacing: '.08em', textTransform: 'uppercase', color: t.dim, marginBottom: 32 }}>
+            {['loading', 'indexing', 'embedding', 'matching'].map((stage, i, all) => (
+              <span key={stage} style={{ color: reviewProgress?.stage === stage ? t.accent : t.dim }}>
+                {stage}{i < all.length - 1 ? ' · ' : ''}
+              </span>
+            ))}
+          </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 12, maxWidth: 480, margin: '0 auto' }}>
             {[
               [questions.length,                                               'Questions'],
@@ -1004,6 +1320,37 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft
         <>
           <div style={{ ...s.eyebrow, marginBottom: 6 }}>Review & Edit</div>
           <div style={{ ...s.heroSerif, fontSize: 26, marginBottom: 24 }}>Review auto-filled answers,<br /><em style={{ color: t.heroMuted }}>resolve flagged items.</em></div>
+
+          {/* What the auto-review actually did, including where it was limited */}
+          {reviewSummary && (
+            <div style={{ ...s.card, padding: '14px 16px', marginBottom: 16 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: reviewSummary.semanticOn === false || reviewSummary.error ? 8 : 0 }}>
+                <Brain size={14} color={t.accent} />
+                <span style={{ fontFamily: t.sansFont, fontSize: 12, color: t.text2 }}>
+                  {reviewSummary.error
+                    ? 'Auto-review could not run — answer these manually.'
+                    : reviewSummary.indexedChunks === 0
+                      ? 'Knowledge base is empty, so nothing could be matched yet.'
+                      : <>Matched against <strong>{reviewSummary.indexedChunks}</strong> knowledge base passage{reviewSummary.indexedChunks !== 1 ? 's' : ''} — <strong>{reviewSummary.coverage}%</strong> of questions have something to work from.</>}
+                </span>
+              </div>
+              {reviewSummary.error && (
+                <div style={{ fontFamily: t.monoFont, fontSize: 10, color: t.dangerText }}>{reviewSummary.error}</div>
+              )}
+              {/* Be explicit when running degraded: a keyword-only run misses
+                  paraphrases, and the analyst should know that before trusting
+                  a "needs manual answer". */}
+              {reviewSummary.semanticOn === false && reviewSummary.indexedChunks > 0 && (
+                <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
+                  <AlertCircle size={11} color={t.warn} style={{ flexShrink: 0, marginTop: 2 }} />
+                  <span style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3, lineHeight: 1.5 }}>
+                    Keyword matching only — semantic matching is off, so reworded questions may have been missed.
+                    {reviewSummary.semanticReason ? ` (${reviewSummary.semanticReason})` : ''}
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10, marginBottom: 24 }}>
             {[
               [questions.length,                                                t.text,   'Total'],
@@ -1042,6 +1389,50 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft
                   <div style={{ background: q.status === 'needs-input' ? t.dangerBg : t.warnBg, border: `0.5px solid ${q.status === 'needs-input' ? t.danger : t.warn}`, borderRadius: 6, padding: '10px 12px', marginTop: 12 }}>
                     <div style={{ fontFamily: t.sansFont, fontSize: 11, fontWeight: 600, color: q.status === 'needs-input' ? t.dangerText : t.warnText, marginBottom: 4 }}>{q.flagReason}</div>
                     <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3 }}><span style={{ color: t.accent }}>Rec: </span>{q.recommendation}</div>
+                  </div>
+                )}
+
+                {/*
+                  The cited source behind a suggestion.
+                  A document passage is shown here and never written into the
+                  answer box automatically — accepting it is an explicit click,
+                  so nobody ships a compliance answer they have not read.
+                */}
+                {q.suggestion && !q.answer && (
+                  <div style={{ background: t.bg3, border: `0.5px solid ${t.border}`, borderRadius: 6, padding: '12px 14px', marginTop: 10 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
+                      <span style={{ ...s.label, color: t.text2 }}>
+                        {q.suggestion.sourceType === 'qa' ? 'Previous answer' : 'From your documents'}
+                      </span>
+                      <span style={s.pill(t.bg2, t.text3)}>{q.suggestion.sourceName}{q.suggestion.page ? ` · p.${q.suggestion.page}` : ''}</span>
+                      <span style={s.pill(t.bg2, t.text3)}>{q.suggestion.method}</span>
+                    </div>
+
+                    {/* The original question, when we are reusing an answer */}
+                    {q.suggestion.sourceType === 'qa' && q.suggestion.question && (
+                      <div style={{ fontFamily: t.sansFont, fontSize: 11, fontStyle: 'italic', color: t.text3, marginBottom: 6 }}>
+                        asked as: “{q.suggestion.question}”
+                      </div>
+                    )}
+
+                    <div style={{ fontFamily: t.sansFont, fontSize: 12, color: t.text2, lineHeight: 1.6, marginBottom: 10, maxHeight: 132, overflowY: 'auto' }}>
+                      {q.suggestion.text}
+                    </div>
+
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+                      <span style={{ fontFamily: t.sansFont, fontSize: 10, color: t.dim }}>
+                        {q.suggestion.matchedOn.length > 0
+                          ? `matched on ${q.suggestion.matchedOn.join(', ')}`
+                          : 'matched semantically'}
+                        {` · keyword ${q.suggestion.lexical}% · semantic ${q.suggestion.semantic}%`}
+                      </span>
+                      <button
+                        onClick={() => acceptSuggestion(q.id)}
+                        style={{ ...s.accentBtn, fontSize: 11, padding: '5px 12px', display: 'inline-flex', alignItems: 'center', gap: 5 }}
+                      >
+                        <CheckCircle size={11} />Use this answer
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>
@@ -1097,10 +1488,11 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft
           vendor={vendor}
           questions={questions}
           onBack={() => setStep('review')}
-          onComplete={() => {
+          questionnaireId={draftId}
+          onComplete={(attachedDocs = []) => {
             // Save completed questionnaire to shared knowledge base
             const entry = {
-              id:         Date.now(),
+              id:         `kb_${Date.now()}`,
               vendor:     vendor || 'Unnamed vendor',
               date:       new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
               questions:  questions.length,
@@ -1112,10 +1504,15 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft
                 : 0,
               source:     'Complete questionnaire',
               qaData:     questions.map(q => ({ text: q.text, answer: q.answer, source: q.source })),
+              savedAt:    new Date().toISOString(),
             };
             if (onAddToKb) onAddToKb(entry);
             if (onDeleteDraft) onDeleteDraft(draftId); // remove from drafts on completion
-            sessionStorage.removeItem('serotonin_q_progress');
+            try { localStorage.removeItem(PROGRESS_KEY); } catch {}
+            setAttachedCount(attachedDocs.length);
+            // The questionnaire is done; its attachment rows and stored files
+            // would otherwise be orphaned in DynamoDB and S3 forever.
+            if (onReleaseAttachments) onReleaseAttachments(draftId);
             setStep('complete');
           }}
         />
@@ -1130,7 +1527,7 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft
             {[
               [questions.length,                                                          'Questions answered'],
               [`${questions.filter(q => q.answer?.trim()).length}/${questions.length}`,   'Answers filled'],
-              ['3',                                                                        'Docs attached'],
+              [String(attachedCount),                                                     'Docs attached'],
             ].map(([v, l]) => (
               <div key={l} style={{ ...s.card, padding: '16px', textAlign: 'center' }}>
                 <div style={{ fontFamily: t.serifFont, fontSize: 22, fontWeight: 400, color: t.accent }}>{v}</div>
@@ -1437,6 +1834,52 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
   const [docNote,       setDocNote]       = useState('');
   const [importing,     setImporting]     = useState(false);
   const [importedFiles, setImportedFiles] = useState([]);
+  const [importError,   setImportError]   = useState('');   // surfaced if bytes fail to store
+
+  // Whether a real AWS backend is behind this build. Drives the Storage &
+  // Security panel so it describes what is actually running.
+  const [amplifyOn, setAmplifyOn] = useState(isAmplifyConfigured());
+  useEffect(() => { whenReady().then(setAmplifyOn); }, []);
+
+  // ── Auto-review index coverage ─────────────────────────────────
+  // Chunks are loaded here rather than at app boot: the embeddings make them
+  // heavy, and only this screen and a match run need them.
+  const [chunks, setChunks]         = useState([]);
+  const [indexLoading, setIndexing] = useState(true);
+  const [backfilling, setBackfill]  = useState(null); // { done, total, label }
+  const [backfillDone, setBackfillDone] = useState(null);
+
+  const refreshIndex = useCallback(() => {
+    setIndexing(true);
+    loadChunks()
+      .then(rows => setChunks(rows))
+      .catch(err => console.warn('[serotonin] Could not load the index.', err))
+      .finally(() => setIndexing(false));
+  }, []);
+
+  useEffect(() => { refreshIndex(); }, [refreshIndex]);
+
+  const coverage = indexCoverage({ docs: kbDocs, entries: kbEntries, chunks });
+  const indexedSourceIds = new Set(chunks.map(c => String(c.sourceId)));
+
+  const runBackfill = async () => {
+    setBackfillDone(null);
+    setBackfill({ done: 0, total: coverage.pending, label: 'Starting' });
+    try {
+      const result = await backfillIndex({
+        docs: kbDocs,
+        entries: kbEntries,
+        chunks,
+        onProgress: setBackfill,
+      });
+      setBackfillDone(result);
+    } catch (err) {
+      setBackfillDone({ indexed: 0, chunks: 0, warnings: [String(err?.message || err)] });
+    } finally {
+      setBackfill(null);
+      refreshIndex();
+    }
+  };
   const [deleteConfirm, setDeleteConfirm] = useState(null); // entry to confirm-delete
 
   // Derive tag list from real entries only
@@ -1467,7 +1910,22 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
               <div><div style={{ ...s.heroSerif, fontSize: 22 }}>Storage & Security</div><div style={{ fontFamily: t.sansFont, fontSize: 12, color: t.text3, marginTop: 4 }}>How Serotonin stores and protects your data</div></div>
               <button onClick={() => setShowStorage(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.text3 }}><X size={18} /></button>
             </div>
-            {[['Primary', 'Encrypted cloud database (AWS RDS / GCP SQL). Backups every 6 hours.'], ['Files', 'Encrypted object storage (S3/GCS) with versioning enabled.'], ['Search', 'Elasticsearch cluster — full-text search under 500ms.'], ['Backup', 'Geo-redundant, multiple regions, 90-day retention.']].map(([k, v]) => (
+            {/* Describes what is actually running, which depends on whether an
+                Amplify backend is attached to this build. */}
+            {(amplifyOn
+              ? [
+                  ['Primary', 'AWS DynamoDB via AppSync. Encrypted at rest, point-in-time recovery available.'],
+                  ['Files', 'Amazon S3. Encrypted at rest, served through short-lived signed URLs.'],
+                  ['Search', 'Client-side over your own records — nothing leaves the browser to be indexed.'],
+                  ['Offline', 'Every read is mirrored on this device, so a dropped connection still renders your data.'],
+                ]
+              : [
+                  ['Primary', 'This device only — no backend is attached to this build.'],
+                  ['Files', 'Stored in this browser (IndexedDB). They survive a refresh but do not sync anywhere.'],
+                  ['Search', 'Client-side over your own records.'],
+                  ['Sync', 'Attach an AWS Amplify backend to persist across devices — see AMPLIFY_SETUP.md.'],
+                ]
+            ).map(([k, v]) => (
               <div key={k} style={{ display: 'flex', gap: 12, marginBottom: 12 }}>
                 <div style={{ width: 6, height: 6, borderRadius: '50%', background: t.accent, marginTop: 6, flexShrink: 0 }} />
                 <div><span style={{ fontFamily: t.sansFont, fontSize: 12, fontWeight: 600, color: t.text }}>{k}: </span><span style={{ fontFamily: t.sansFont, fontSize: 12, color: t.text3 }}>{v}</span></div>
@@ -1511,6 +1969,74 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
               </div>
             ))}
           </div>
+
+          {/*
+            Auto-review index status.
+            Documents imported before this feature existed have a stored file but
+            no extracted text, so auto-review can never find them. Rather than
+            leaving the library quietly broken, say how much is searchable and
+            offer to fix the rest.
+          */}
+          {(kbDocs.length > 0 || kbEntries.length > 0 || chunks.length > 0) && (
+            <div style={{ ...s.card, padding: '14px 16px', marginBottom: 22 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, flex: 1, minWidth: 220 }}>
+                  <Brain size={15} color={t.accent} style={{ flexShrink: 0, marginTop: 2 }} />
+                  <div>
+                    <div style={{ ...s.label, marginBottom: 3 }}>Auto-review index</div>
+                    <div style={{ fontFamily: t.sansFont, fontSize: 12, color: t.text3, lineHeight: 1.5 }}>
+                      {indexLoading
+                        ? 'Checking…'
+                        : chunks.length === 0
+                          ? 'Nothing indexed yet — incoming questionnaires cannot be matched against anything.'
+                          : <>
+                              <strong style={{ color: t.text2 }}>{coverage.chunks}</strong> passage{coverage.chunks !== 1 ? 's' : ''} searchable
+                              {' '}({coverage.documentChunks} from documents, {coverage.qaChunks} from past answers)
+                              {coverage.withoutVectors > 0 && (
+                                <span style={{ color: t.text3 }}> · {coverage.withoutVectors} without embeddings, keyword-only</span>
+                              )}
+                            </>}
+                      {!indexLoading && coverage.pending > 0 && (
+                        <span style={{ color: t.warnText }}>
+                          {' '}· <strong>{coverage.pending}</strong> item{coverage.pending !== 1 ? 's' : ''} not indexed
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {backfilling ? (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontFamily: t.sansFont, fontSize: 11, color: t.accent }}>
+                    <Activity size={12} />
+                    {backfilling.label} ({backfilling.done}/{backfilling.total})
+                  </div>
+                ) : coverage.pending > 0 ? (
+                  <button onClick={runBackfill} style={{ ...s.accentBtn, fontSize: 11, padding: '6px 14px', display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                    <Brain size={12} />Index {coverage.pending} item{coverage.pending !== 1 ? 's' : ''}
+                  </button>
+                ) : chunks.length > 0 ? (
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontFamily: t.sansFont, fontSize: 11, color: t.accent, flexShrink: 0 }}>
+                    <CheckCircle size={12} />Everything indexed
+                  </span>
+                ) : null}
+              </div>
+
+              {backfillDone && (
+                <div style={{ marginTop: 10, paddingTop: 10, borderTop: `0.5px solid ${t.border}` }}>
+                  <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text2 }}>
+                    Indexed {backfillDone.indexed} item{backfillDone.indexed !== 1 ? 's' : ''} into {backfillDone.chunks} passage{backfillDone.chunks !== 1 ? 's' : ''}
+                    {backfillDone.embedded > 0 ? ` · ${backfillDone.embedded} embedded` : ' · embeddings unavailable, keyword matching only'}
+                  </div>
+                  {(backfillDone.warnings || []).slice(0, 4).map((w, i) => (
+                    <div key={i} style={{ display: 'flex', gap: 5, marginTop: 5 }}>
+                      <AlertTriangle size={11} color={t.warn} style={{ flexShrink: 0, marginTop: 2 }} />
+                      <span style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3, lineHeight: 1.5 }}>{w}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Filter tabs */}
           <div style={{ display: 'flex', gap: 6, marginBottom: 14 }}>
@@ -1557,6 +2083,17 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
           )}
 
           {/* Policy documents view */}
+          {/* Surfaced when a document record saved but its bytes did not */}
+          {importError && (
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '10px 14px', background: t.warnBg, border: `0.5px solid ${t.warn}`, borderRadius: 7, marginBottom: 12 }}>
+              <AlertTriangle size={14} color={t.warn} style={{ flexShrink: 0, marginTop: 1 }} />
+              <span style={{ fontFamily: t.sansFont, fontSize: 12, color: t.warnText, lineHeight: 1.5 }}>{importError}</span>
+              <button onClick={() => setImportError('')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.warnText, padding: 0, display: 'flex', flexShrink: 0 }}>
+                <X size={13} />
+              </button>
+            </div>
+          )}
+
           {activeFilter === 'documents' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 4 }}>
               {kbDocs.length === 0 ? (
@@ -1590,19 +2127,40 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
                           <span style={s.pill(t.accentBg, t.accentText)}>{doc.category}</span>
                           <span style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3 }}>{doc.size}</span>
                           <span style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3 }}>{doc.date}</span>
+                          {/* Whether auto-review can actually see this document */}
+                          {!indexLoading && (
+                            indexedSourceIds.has(String(doc.id))
+                              ? <span style={s.pill(t.doneBg, t.done)}>Searchable</span>
+                              : <span style={s.pill(t.warnBg, t.warnText)}>Not indexed</span>
+                          )}
                         </div>
                         {doc.note && (
                           <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text2, marginTop: 6, lineHeight: 1.5 }}>{doc.note}</div>
                         )}
                       </div>
-                      {/* Remove */}
-                      <button
-                        onClick={() => onRemoveDoc && onRemoveDoc(doc.id)}
-                        style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.text3, padding: 4, display: 'flex', alignItems: 'center', flexShrink: 0 }}
-                        title="Remove"
-                      >
-                        <X size={14} />
-                      </button>
+                      {/* Open / remove */}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
+                        {doc.storagePath ? (
+                          <button
+                            onClick={() => openFile(doc.storagePath, { filename: doc.name })}
+                            style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.accent, padding: 4, display: 'flex', alignItems: 'center' }}
+                            title="Open document"
+                          >
+                            <Download size={14} />
+                          </button>
+                        ) : (
+                          <span title="Metadata only — the file itself was not stored" style={{ display: 'flex', padding: 4, color: t.text3 }}>
+                            <AlertCircle size={14} />
+                          </span>
+                        )}
+                        <button
+                          onClick={() => onRemoveDoc && onRemoveDoc(doc.id)}
+                          style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.text3, padding: 4, display: 'flex', alignItems: 'center' }}
+                          title="Remove"
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </>
@@ -1872,30 +2430,78 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
             </button>
             <button
               disabled={importedFiles.length === 0 || !docCategory || importing}
-              onClick={() => {
+              onClick={async () => {
                 if (!docCategory || importedFiles.length === 0) return;
                 setImporting(true);
-                // Simulate brief import then save each file to kbDocs
-                setTimeout(() => {
-                  importedFiles.forEach(f => {
-                    onAddDoc && onAddDoc({
-                      id:       Date.now() + Math.random(),
-                      name:     f.name,
-                      category: docCategory,
-                      note:     docNote,
-                      size:     f.size < 1024 ? f.size + ' B' : f.size < 1048576 ? (f.size/1024).toFixed(1) + ' KB' : (f.size/1048576).toFixed(1) + ' MB',
-                      date:     new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
-                      source:   'Imported',
-                      tags:     [docCategory],
-                    });
-                  });
-                  setImporting(false);
-                  setImportedFiles([]);
-                  setDocCategory('');
-                  setDocNote('');
-                  setActiveFilter('documents');
-                  setView('library');
-                }, 800);
+                setImportError('');
+                // Upload each file for real, then save its record. The old
+                // version faked an 800ms delay and dropped the bytes on the
+                // floor — the metadata persisted, the document did not.
+                const failed = [];
+                const unreadable = [];
+                const indexJobs = [];
+                for (const f of importedFiles) {
+                  const stored = await uploadFile(f.file, { folder: 'kb-documents' });
+                  if (stored.error) failed.push(stored.name);
+
+                  // Extract the text now, while the file is in hand, so it can
+                  // be indexed for auto-review without a second download.
+                  let extracted = null;
+                  try {
+                    extracted = await extractText(f.file);
+                    if (extracted.error) {
+                      unreadable.push(`${stored.name}: ${extracted.error}`);
+                      extracted = null;
+                    }
+                  } catch (err) {
+                    unreadable.push(`${stored.name}: ${err?.message || err}`);
+                    extracted = null;
+                  }
+
+                  const job = onAddDoc && onAddDoc({
+                    id:          `doc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                    name:        stored.name,
+                    category:    docCategory,
+                    note:        docNote,
+                    size:        formatBytes(stored.sizeBytes),
+                    sizeBytes:   stored.sizeBytes,
+                    contentType: stored.contentType,
+                    storagePath: stored.storagePath,
+                    date:        new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
+                    source:      'Imported',
+                    tags:        [docCategory],
+                    savedAt:     new Date().toISOString(),
+                  }, extracted);
+                  if (job?.then) indexJobs.push(job);
+                }
+
+                // Wait for indexing before reporting status, so the library does
+                // not show "Not indexed" for a document it is still indexing.
+                const outcomes = await Promise.all(indexJobs);
+                for (const outcome of outcomes) {
+                  if (outcome?.warning) unreadable.push(outcome.warning);
+                }
+                setImporting(false);
+                setImportedFiles([]);
+                setDocCategory('');
+                setDocNote('');
+                setActiveFilter('documents');
+                setView('library');
+                const problems = [];
+                if (failed.length > 0) {
+                  problems.push(
+                    `The file itself could not be stored for: ${failed.join(', ')}. ` +
+                    'The record is in your library — re-import to retry the upload.',
+                  );
+                }
+                if (unreadable.length > 0) {
+                  // Stored but not indexed: it will not turn up in auto-review.
+                  problems.push(
+                    `Stored, but not searchable by auto-review — ${unreadable.join('; ')}`,
+                  );
+                }
+                if (problems.length > 0) setImportError(problems.join(' '));
+                refreshIndex();
               }}
               style={{
                 ...s.accentBtn,
@@ -2952,7 +3558,7 @@ function NotificationsPanel({ t, s, notifs, onClear, onClearAll, onMarkRead, onM
 
 // ─── PROFILE PANEL ───────────────────────────────────────────────────────────
 
-function ProfilePanel({ t, s, profile, authUser, onUpdateProfile, onOpenSettings, onSignOut, onClose }) {
+function ProfilePanel({ t, s, profile, authUser, avatarUrl, onSetAvatarUrl, onUpdateProfile, onOpenSettings, onSignOut, onClose }) {
   const [activeTab, setActiveTab] = useState('profile');
   const [editName,  setEditName]  = useState(profile.name);
   const [editTitle, setEditTitle] = useState(profile.title);
@@ -3035,18 +3641,26 @@ function ProfilePanel({ t, s, profile, authUser, onUpdateProfile, onOpenSettings
           {/* Avatar with upload overlay */}
           <div style={{ position: 'relative', flexShrink: 0 }}>
             <div style={{ width: 52, height: 52, borderRadius: '50%', background: t.accentBg, border: `1.5px solid ${t.accent}`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: t.serifFont, fontSize: 18, fontWeight: 400, fontStyle: 'italic', color: t.accent, overflow: 'hidden' }}>
-              {profile.avatarUrl
-                ? <img src={profile.avatarUrl} alt="avatar" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+              {avatarUrl
+                ? <img src={avatarUrl} alt="avatar" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                 : initials
               }
             </div>
             <label title="Upload photo" style={{ position: 'absolute', bottom: -2, right: -2, width: 20, height: 20, borderRadius: '50%', background: t.accent, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', border: `1.5px solid ${t.bg}` }}>
               <Upload size={9} color="#fff" />
-              <input type="file" accept="image/*" style={{ display: 'none' }} onChange={e => {
+              <input type="file" accept="image/*" style={{ display: 'none' }} onChange={async e => {
                 const file = e.target.files[0];
+                e.target.value = '';
                 if (!file) return;
-                const url = URL.createObjectURL(file);
-                onUpdateProfile({ ...profile, avatarUrl: url });
+                // Show it instantly, then persist the bytes and keep the path.
+                // Only avatarPath goes into the profile record — the blob URL
+                // would not survive a refresh, and writing it would churn the
+                // profile object identity for no gain.
+                onSetAvatarUrl(URL.createObjectURL(file));
+                const stored = await uploadFile(file, { folder: 'avatars' });
+                if (stored.storagePath) {
+                  onUpdateProfile(prev => ({ ...(prev || profile), avatarPath: stored.storagePath }));
+                }
               }} />
             </label>
           </div>
@@ -3567,81 +4181,137 @@ export default function Serotonin() {
   const [module, setModuleState] = useState(getModuleFromHash);
   const [resumeDraftId, setResumeDraftId] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [themeKey, setThemeKey]   = useState(() => sessionStorage.getItem('serotonin_theme') || 'forest');
+  // Validated against THEMES: a corrupt stored value used to die with the tab
+  // under sessionStorage, but in local storage it would break every load.
+  const [themeKey, setThemeKey]   = useLocalValue(
+    'theme',
+    'forest',
+    key => typeof key === 'string' && Object.prototype.hasOwnProperty.call(THEMES, key),
+  );
   const [notifOpen, setNotifOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
-  const [notifs, setNotifs]       = useState(INITIAL_NOTIFS);
+
+  // Notification feed. Seeded with the demo items the first time a visitor
+  // arrives; after that, reads and dismissals persist like everything else.
+  const {
+    items: notifs,
+    remove: removeNotif,
+    removeAll: removeAllNotifs,
+    patch: patchNotifs,
+  } = usePersistentList('notifications', {
+    seed: () => INITIAL_NOTIFS.map((n, i) => ({ ...n, sortIndex: i })),
+  });
   const [authUser, setAuthUser]   = useState(null);
   const [authReady, setAuthReady] = useState(false);
   const scale = useViewportScale();
 
-  // ── Draft questionnaires — shared between Dashboard and Editor ─
-  const [drafts, setDrafts] = useState(() => {
-    try { return JSON.parse(sessionStorage.getItem('serotonin_drafts') || '[]'); }
-    catch { return []; }
-  });
+  // ── Durable collections ────────────────────────────────────────
+  // Backed by Amplify Data (AppSync + DynamoDB) when a backend is attached,
+  // and by this device's local storage otherwise. Either way the data now
+  // survives a refresh, a closed tab and a restarted browser — which the
+  // previous sessionStorage implementation did not.
+
+  // Draft questionnaires — shared between Dashboard and Editor.
+  const {
+    items: drafts,
+    save: saveDraftRecord,
+    remove: deleteDraftRecord,
+    loading: draftsLoading,
+  } = usePersistentList('drafts');
 
   const saveDraft = (draft) => {
-    setDrafts(prev => {
-      // Update existing or prepend new
-      const exists = prev.find(d => d.id === draft.id);
-      const next = exists
-        ? prev.map(d => d.id === draft.id ? draft : d)
-        : [draft, ...prev];
-      try { sessionStorage.setItem('serotonin_drafts', JSON.stringify(next)); } catch {}
-      return next;
+    saveDraftRecord(draft);
+    recordAudit('questionnaire.save', 'Questionnaire', draft?.id, {
+      vendor: draft?.vendor,
+      step: draft?.step,
+      progress: draft?.progress,
     });
   };
 
   const deleteDraft = (id) => {
-    setDrafts(prev => {
-      const next = prev.filter(d => d.id !== id);
-      try { sessionStorage.setItem('serotonin_drafts', JSON.stringify(next)); } catch {}
-      return next;
-    });
+    deleteDraftRecord(id);
+    recordAudit('questionnaire.delete', 'Questionnaire', id);
   };
-  const [kbEntries, setKbEntries] = useState(() => {
-    try { return JSON.parse(sessionStorage.getItem('serotonin_kb') || '[]'); }
-    catch { return []; }
-  });
+
+  // Attachments outlive the questionnaire unless something clears them. Called
+  // when an assessment is completed or discarded, so neither the Attachment
+  // table nor the S3 bucket accumulates rows and objects nothing points at.
+  const releaseAttachments = (questionnaireId) => {
+    if (!questionnaireId) return;
+    deleteWhere('attachments', a => String(a.questionnaireId) === String(questionnaireId))
+      .then(removedRows => {
+        for (const row of removedRows) {
+          if (row.storagePath) removeFile(row.storagePath);
+        }
+      })
+      .catch(err => console.warn('[serotonin] Could not clean up attachments.', err));
+  };
+
+  // Completed questionnaires, indexed into the knowledge base.
+  const {
+    items: kbEntries,
+    save: addKbEntryRecord,
+    remove: deleteKbEntryRecord,
+    loading: kbLoading,
+  } = usePersistentList('kbEntries');
 
   const addKbEntry = (entry) => {
-    setKbEntries(prev => {
-      const next = [entry, ...prev];
-      try { sessionStorage.setItem('serotonin_kb', JSON.stringify(next)); } catch {}
-      return next;
+    addKbEntryRecord(entry);
+    recordAudit('kb.create', 'KbEntry', entry?.id, { vendor: entry?.vendor });
+    // Index the answers so the next questionnaire asking the same thing can
+    // reuse them. This is what makes the knowledge base compound.
+    return indexQaPairs(entry).catch(err => {
+      console.warn('[serotonin] Could not index the completed questionnaire.', err);
+      return null;
     });
   };
 
   const deleteKbEntry = (id) => {
-    setKbEntries(prev => {
-      const next = prev.filter(e => e.id !== id);
-      try { sessionStorage.setItem('serotonin_kb', JSON.stringify(next)); } catch {}
-      return next;
-    });
+    deleteKbEntryRecord(id);
+    removeChunksFor(id);
+    recordAudit('kb.delete', 'KbEntry', id);
   };
 
   // ── Imported policy documents ──────────────────────────────────
-  const [kbDocs, setKbDocs] = useState(() => {
-    try { return JSON.parse(sessionStorage.getItem('serotonin_kb_docs') || '[]'); }
-    catch { return []; }
-  });
+  const {
+    items: kbDocs,
+    save: saveKbDocRecord,
+    remove: removeKbDocRecord,
+  } = usePersistentList('kbDocs');
 
-  const addKbDoc = (doc) => {
-    setKbDocs(prev => {
-      const next = [doc, ...prev];
-      try { sessionStorage.setItem('serotonin_kb_docs', JSON.stringify(next)); } catch {}
-      return next;
+  // `extracted` is the parse result from the import screen, passed through so
+  // the file does not have to be downloaded and parsed a second time.
+  //
+  // Returns the indexing promise so the caller can wait for it before showing
+  // index status — otherwise the library reports "Not indexed" for a document it
+  // is in the middle of indexing, and only a reload fixes it.
+  const addKbDoc = (doc, extracted = null) => {
+    saveKbDocRecord(doc);
+    recordAudit('document.import', 'KbDocument', doc?.id, {
+      name: doc?.name,
+      category: doc?.category,
+    });
+    return indexDocument(doc, extracted).catch(err => {
+      console.warn('[serotonin] Could not index the imported document.', err);
+      return null;
     });
   };
 
+  // Deleting the record has to take the stored file and its index entries with
+  // it, otherwise the S3 bucket accumulates orphaned objects and auto-review
+  // keeps citing a document that is no longer in the library.
   const removeKbDoc = (id) => {
-    setKbDocs(prev => {
-      const next = prev.filter(d => d.id !== id);
-      try { sessionStorage.setItem('serotonin_kb_docs', JSON.stringify(next)); } catch {}
-      return next;
-    });
+    const doc = kbDocs.find(d => String(d.id) === String(id));
+    removeKbDocRecord(id);
+    if (doc?.storagePath) removeFile(doc.storagePath);
+    removeChunksFor(id);
+    recordAudit('document.delete', 'KbDocument', id, { name: doc?.name });
   };
+
+  // ── One-time migration off the old sessionStorage keys ──────────
+  // Anyone who had the previous build open would otherwise lose their drafts
+  // the moment this version loads.
+  useEffect(() => { migrateLegacySessionState(); }, []);
 
   // Wrap setModule to also update the URL hash
   const setModule = (mod) => {
@@ -3673,16 +4343,18 @@ export default function Serotonin() {
     document.head.appendChild(link);
   }, [themeKey]);
 
-  // Persist theme preference
-  useEffect(() => {
-    sessionStorage.setItem('serotonin_theme', themeKey);
-  }, [themeKey]);
-  const [profile, setProfile] = useState({
+  // Theme choice persists via useLocalValue above — no extra effect needed.
+
+  // ── Profile + preferences ──────────────────────────────────────
+  // usePersistentProfile keeps useState's setter contract (value or updater),
+  // so ProfilePanel's onUpdateProfile prop needs no changes. Writes are
+  // debounced because the panel saves on every keystroke and toggle.
+  const { profile, setProfile } = usePersistentProfile({
     name:       '',
     title:      '',
     email:      '',
     department: '',
-    avatarUrl:  null,
+    avatarPath: '',
     prefs: {
       notifReview:    true,
       notifAssigned:  true,
@@ -3707,6 +4379,24 @@ export default function Serotonin() {
       email: authUser.email || prev.email,
     }));
   }, [authUser]);
+
+  // ── Rehydrate the avatar ───────────────────────────────────────
+  // Only the storage path is persisted; the displayable URL is resolved fresh
+  // each load, because a blob URL dies with the page and an S3 signed URL
+  // expires. It is held outside `profile` on purpose — routing it through
+  // setProfile would change the profile object's identity, and ProfilePanel
+  // resets its edit fields whenever that happens, silently discarding whatever
+  // the user was typing.
+  const [avatarUrl, setAvatarUrl] = useState(null);
+
+  useEffect(() => {
+    if (!profile.avatarPath || avatarUrl) return;
+    let cancelled = false;
+    getFileUrl(profile.avatarPath).then(url => {
+      if (!cancelled && url) setAvatarUrl(url);
+    });
+    return () => { cancelled = true; };
+  }, [profile.avatarPath, avatarUrl]);
 
   const t = THEMES[themeKey];
   const s = useThemeStyles(t);
@@ -3764,10 +4454,10 @@ export default function Serotonin() {
     return () => clearTimeout(timeout);
   }, []);
 
-  const handleClearNotif  = (id) => setNotifs(prev => prev.filter(n => n.id !== id));
-  const handleClearAll    = ()   => setNotifs([]);
-  const handleMarkRead    = (id) => setNotifs(prev => prev.map(n => n.id === id ? { ...n, read: true } : n));
-  const handleMarkAllRead = ()   => setNotifs(prev => prev.map(n => ({ ...n, read: true })));
+  const handleClearNotif  = (id) => removeNotif(id);
+  const handleClearAll    = ()   => removeAllNotifs();
+  const handleMarkRead    = (id) => patchNotifs(n => String(n.id) === String(id) && !n.read, { read: true });
+  const handleMarkAllRead = ()   => patchNotifs(n => !n.read, { read: true });
   const handleOpenSettings = ()  => { setProfileOpen(false); setModule('settings'); };
 
   const handleSignOut = async () => {
@@ -3887,8 +4577,8 @@ export default function Serotonin() {
               onClick={() => { setProfileOpen(o => !o); setNotifOpen(false); }}
               style={{ width: 32, height: 32, borderRadius: '50%', background: profileOpen ? t.accent : t.accentBg, border: `1.5px solid ${t.accent}`, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', overflow: 'hidden', padding: 0 }}
             >
-              {profile.avatarUrl
-                ? <img src={profile.avatarUrl} alt="avatar" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+              {avatarUrl
+                ? <img src={avatarUrl} alt="avatar" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                 : <span style={{ fontFamily: t.serifFont, fontSize: 11, fontWeight: 400, fontStyle: 'italic', color: profileOpen ? '#fff' : t.accent }}>{initials}</span>
               }
             </button>
@@ -3899,6 +4589,8 @@ export default function Serotonin() {
                 t={t} s={s}
                 profile={profile}
                 authUser={authUser}
+                avatarUrl={avatarUrl}
+                onSetAvatarUrl={setAvatarUrl}
                 onUpdateProfile={setProfile}
                 onOpenSettings={handleOpenSettings}
                 onSignOut={handleSignOut}
@@ -3942,7 +4634,7 @@ export default function Serotonin() {
         {/* Main content */}
         <main style={{ flex: 1, overflowY: 'auto', padding: '32px 36px 80px', scrollBehavior: 'smooth' }}>
           {module === 'dashboard' && <Dashboard t={t} s={s} onNavigate={setModule} kbEntries={kbEntries} drafts={drafts} onResumeDraft={(draft) => { setResumeDraftId(draft.id); setModule('editor'); }} profile={profile} />}
-          {module === 'editor'    && <QuestionnaireEditor t={t} s={s} onBack={() => { setResumeDraftId(null); setModule('dashboard'); }} onAddToKb={addKbEntry} drafts={drafts} onSaveDraft={saveDraft} onDeleteDraft={deleteDraft} profile={profile} resumeDraftId={resumeDraftId} onClearResume={() => setResumeDraftId(null)} />}
+          {module === 'editor'    && <QuestionnaireEditor t={t} s={s} onBack={() => { setResumeDraftId(null); setModule('dashboard'); }} onAddToKb={addKbEntry} drafts={drafts} onSaveDraft={saveDraft} onDeleteDraft={deleteDraft} profile={profile} resumeDraftId={resumeDraftId} onClearResume={() => setResumeDraftId(null)} onReleaseAttachments={releaseAttachments} />}
           {module === 'vendor'    && <VendorDashboard t={t} s={s} />}
           {module === 'batch'     && <BatchProcessing t={t} s={s} />}
           {module === 'knowledge' && <KnowledgeBase t={t} s={s} kbEntries={kbEntries} kbDocs={kbDocs} onAddDoc={addKbDoc} onRemoveDoc={removeKbDoc} onDeleteEntry={deleteKbEntry} />}

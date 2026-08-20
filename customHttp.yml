@@ -1,0 +1,49 @@
+# Security response headers for AWS Amplify Hosting.
+#
+# This is Amplify's equivalent of the headers block in vercel.json (which is
+# kept in the repo but is inert on Amplify). Amplify reads this file from the
+# repo root on every deploy.
+#
+# Note the CSP: 'unsafe-inline' for styles is required because the whole app is
+# built with inline styles and a semantic token system rather than a stylesheet.
+# connect-src has to allow the AppSync and S3 endpoints Amplify generates, plus
+# Cognito for auth.
+
+customHeaders:
+  - pattern: '**'
+    headers:
+      - key: Strict-Transport-Security
+        value: 'max-age=63072000; includeSubDomains; preload'
+      - key: X-Content-Type-Options
+        value: 'nosniff'
+      - key: X-Frame-Options
+        value: 'DENY'
+      - key: Referrer-Policy
+        value: 'strict-origin-when-cross-origin'
+      - key: Permissions-Policy
+        value: 'camera=(), microphone=(), geolocation=(), payment=()'
+      - key: Cross-Origin-Opener-Policy
+        value: 'same-origin'
+      - key: Content-Security-Policy
+        value: >-
+          default-src 'self';
+          script-src 'self';
+          style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
+          font-src 'self' https://fonts.gstatic.com data:;
+          img-src 'self' data: blob: https://*.amazonaws.com;
+          connect-src 'self' https://*.amazonaws.com wss://*.amazonaws.com https://*.amplifyapp.com;
+          frame-ancestors 'none';
+          base-uri 'self';
+          form-action 'self';
+          object-src 'none'
+
+  # Hashed assets are immutable; index.html must never be cached or users get a
+  # stale bundle pointing at deleted asset hashes after a deploy.
+  - pattern: '/assets/**'
+    headers:
+      - key: Cache-Control
+        value: 'public, max-age=31536000, immutable'
+  - pattern: '/index.html'
+    headers:
+      - key: Cache-Control
+        value: 'no-cache, no-store, must-revalidate'

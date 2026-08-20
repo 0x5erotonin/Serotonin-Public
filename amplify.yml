@@ -1,0 +1,37 @@
+version: 1
+
+# AWS Amplify Hosting build spec.
+#
+# The `backend` phase runs first and is what provisions Cognito, AppSync,
+# DynamoDB and S3 from the TypeScript definitions in amplify/. It also writes
+# amplify_outputs.json into the repo root, which the frontend build then picks
+# up — so the ordering here matters: the frontend cannot know its endpoints
+# until pipeline-deploy has run.
+#
+# On a branch with no backend permissions (a preview build, a fork), the backend
+# phase fails, amplify_outputs.json is never written, and the app falls back to
+# on-device storage rather than shipping broken. That is deliberate.
+
+backend:
+  phases:
+    build:
+      commands:
+        - npm ci --cache .npm --prefer-offline
+        - npx ampx pipeline-deploy --branch $AWS_BRANCH --app-id $AWS_APP_ID
+
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - npm ci --cache .npm --prefer-offline
+    build:
+      commands:
+        - npm run build
+  artifacts:
+    baseDirectory: dist
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*
+      - .npm/**/*

@@ -6,8 +6,8 @@
 
 ![React](https://img.shields.io/badge/React_18-20232A?style=flat&logo=react&logoColor=61DAFB)
 ![Vite](https://img.shields.io/badge/Vite-646CFF?style=flat&logo=vite&logoColor=white)
-![Supabase](https://img.shields.io/badge/Supabase-3ECF8E?style=flat&logo=supabase&logoColor=white)
-![Vercel](https://img.shields.io/badge/Vercel-000000?style=flat&logo=vercel&logoColor=white)
+![AWS Amplify](https://img.shields.io/badge/AWS_Amplify-FF9900?style=flat&logo=awsamplify&logoColor=white)
+![DynamoDB](https://img.shields.io/badge/DynamoDB-4053D6?style=flat&logo=amazondynamodb&logoColor=white)
 
 ---
 
@@ -23,13 +23,15 @@ Then it happens again next month. And the month after that.
 
 ## ✨ What it does
 
-**📋 Complete questionnaires** — Import from Gmail, Google Drive, file upload, or paste directly. Serotonin searches your answer history and auto-fills with confidence scoring. High confidence = auto-filled. Low confidence = flagged for you to check. Five-step workflow: import → process → review → approve → send.
+**📋 Complete questionnaires** — Upload the PDF, DOCX or CSV a vendor sent you and Serotonin reads it: pulls the questions out, then checks each one against everything you've answered before and every policy document you've imported. Questions you've answered before come back auto-filled and attributed. Questions your SOC 2 report covers come back with the paragraph cited, for you to accept in a click. The rest are flagged as needing a real answer — and it tells you what the closest near-miss was. Five-step workflow: import → auto-review → review → approve → send.
 
-**🧠 Knowledge base** — Every questionnaire you complete gets indexed and searchable. Drop in your SOC 2 reports, access control policies, disaster recovery plans — it'll use them as source material. Gets smarter with every questionnaire you run through it.
+**🧠 Knowledge base** — Every questionnaire you complete gets indexed and searchable, and so does every policy document you import: SOC 2 reports, access control policies, disaster recovery plans are split into passages, embedded, and cited by page. Genuinely gets better with every questionnaire you run through it, because your own answers become the best match for next time.
 
 **📊 Dashboard** — See everything in flight at a glance. Who owns what, where it's at in the workflow, how complete it is, who it's assigned to. One click to pick up where you left off.
 
 **📖 Internal wiki** — Full documentation built directly into the app. 16 articles covering every feature, security posture, tips, and troubleshooting. No external Notion or Confluence required.
+
+**💾 Nothing gets lost** — Drafts autosave as you type. Uploaded documents are stored and downloadable, not just listed. Close the tab, come back tomorrow, pick up mid-questionnaire. Backed by DynamoDB and S3 when a backend is attached, and by durable on-device storage when one isn't.
 
 **🎨 Five themes** — Forest · Chalk · Obsidian · Aero · Oklou. Yes I spent way too long on this. No I don't regret it.
 
@@ -43,19 +45,27 @@ No UI framework. No component library. Just React, inline styles, and a semantic
 |---|---|---|
 | Frontend | React 18 + Vite | Fast dev loop, no framework overhead |
 | Styling | Inline styles + CSS tokens | Full theme control, zero bundle cost |
-| Auth | Supabase Auth | Email/password + Google OAuth out of the box |
-| Database | Supabase Postgres | RLS on every table, audit log, real-time |
-| Storage | Supabase Storage | Policy documents, avatars |
+| Database | Amplify Data → AppSync + DynamoDB | Schema defined in TypeScript, deploys on push |
+| Parsing | PDF.js + Mammoth, client-side | No upload round-trip; works with no backend attached |
+| Matching | BM25 in-browser + Bedrock Titan embeddings | Either signal alone can carry a match |
+| Storage | Amplify Storage → S3 | Policy documents, attachments, avatars |
+| Auth | Cognito (provisioned, not yet enforced) | See the security note below |
 | Routing | Hash-based (`#editor`, `#kb`) | No React Router dep |
-| State | `useState` + `sessionStorage` | Draft persistence without a backend |
-| Hosting | Vercel | Push to deploy, security headers via `vercel.json` |
+| State | `useState` + an async store layer | Durable, with an on-device fallback |
+| Hosting | AWS Amplify Hosting | Push to deploy, headers via `customHttp.yml` |
 
 **Security stuff worth mentioning:**
-- Row Level Security on all 6 database tables — users can only ever see their own data
+- Every record carries an owner key and is scoped to its owner on read
+- Files land under a per-identity S3 prefix, served via short-lived signed URLs
 - Session inactivity timeout (HIPAA §164.312(a)(2)(iii)) — auto-logout after 15 min idle
-- Domain allowlist enforced at the Postgres trigger level — can't be bypassed from the client
 - Full audit log on every create/update/delete
 - HSTS, CSP, X-Frame-Options, Referrer-Policy headers on all responses
+
+> **Auth is provisioned but not yet enforced.** Cognito is deployed and the data
+> layer is ready for owner-based authorization, but nothing forces a sign-in yet,
+> so record scoping is client-side rather than IAM-enforced. Fine for a demo and
+> for your own data; not yet for real customer questionnaires. The exact exposure
+> and the five-step fix are in [AMPLIFY_SETUP.md](AMPLIFY_SETUP.md#️-security-posture-while-auth-is-deferred).
 
 ---
 
@@ -65,52 +75,79 @@ No UI framework. No component library. Just React, inline styles, and a semantic
 Browser (React SPA)
     │
     ├── Hash router  →  #dashboard · #editor · #knowledge · #wiki
-    ├── Shared state →  drafts · kbEntries · kbDocs  (sessionStorage backed)
     ├── Theme system →  5 themes × semantic color tokens
-    └── Supabase client
+    │
+    ├── src/lib/  ── the auto-review pipeline
+    │       extract.js → questionExtract.js → matcher.js
+    │       (PDF.js/Mammoth)   (find questions)   (BM25 + embeddings)
+    │
+    └── src/lib/  ── the persistence seam
+            │         store.js · collections.js · files.js · usePersisted.js
             │
-            ├── auth.users        ← Supabase Auth (email + Google OAuth)
-            ├── profiles          ← extended user data + preferences
-            ├── questionnaires    ← draft and completed assessments
-            ├── questions         ← individual Q&A pairs with confidence scores
-            ├── documents         ← attached policy files
-            ├── notifications     ← real-time notification feed
-            └── audit_log         ← immutable action history
+            ├─ with a backend ─→  AWS Amplify Gen 2
+            │                       ├── UserProfile   ← user data + preferences
+            │                       ├── Questionnaire ← drafts and completed
+            │                       ├── KbEntry       ← completed questionnaires
+            │                       ├── KbDocument    ← imported policy docs
+            │                       ├── KbIndexChunk  ← searchable passages + vectors
+            │                       ├── Attachment    ← files sent with a package
+            │                       ├── Notification  ← notification feed
+            │                       ├── AuditLog      ← immutable action history
+            │                       ├── embedTexts    ← Lambda → Bedrock Titan
+            │                       └── S3 bucket     ← the files themselves
+            │
+            └─ without one ───→  localStorage (records) + IndexedDB (file bytes)
+                                 keyword matching only, no embeddings
 ```
+
+Both paths are durable. The fallback is not a stub — it is what lets the public
+demo work with no AWS account, and it means a misconfigured deploy degrades
+instead of breaking.
 
 ---
 
 ## 🚀 Running locally
 
-**You'll need:** Node 18+, and optionally a Supabase project (the demo runs without one)
+**You'll need:** Node 18+. AWS credentials are optional.
 
 ```bash
-# Clone it
 git clone https://github.com/0x5erotonin/Serotonin-public.git
 cd Serotonin-public
-
-# Install deps
 npm install
-
-# Start the dev server — works without Supabase in demo mode
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173) — the app loads directly, no login required in demo mode.
+Open [http://localhost:5173](http://localhost:5173). No login, and your data
+persists on this device — drafts, uploaded documents and preferences all survive
+a refresh with nothing configured.
 
-**To enable auth + persistence**, connect a Supabase project:
+**To run against real AWS**, start your own isolated cloud sandbox:
 
 ```bash
-cp .env.example .env
-# Fill in VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY
+npm run sandbox      # provisions Cognito + AppSync + DynamoDB + S3, writes amplify_outputs.json
+npm run dev          # in a second terminal — now backed by the cloud
+npm run sandbox:delete   # tear it down when you're done
 ```
 
-Then run the schema:
+Deploying to Amplify Hosting is a `git push` — `amplify.yml` provisions the
+backend and builds the frontend. Full walkthrough, including the two console
+settings you need to flip, in **[AMPLIFY_SETUP.md](AMPLIFY_SETUP.md)**.
+
+### Tests
+
 ```bash
-# Paste docs/supabase_schema.sql into your Supabase SQL Editor and hit Run
-# Creates 6 tables, RLS policies, storage bucket, and auth triggers
-# Takes about 5 seconds
+npx playwright install chromium
+npm run build && npm run preview &
+npm test
 ```
+
+`test:unit` runs the extraction and matching logic in plain Node — six real
+questionnaire formats, hybrid scoring, and performance bounds. `npm test` adds two
+browser suites: one asserting that everything survives a refresh, one driving a
+real PDF through the whole auto-review chain with the real PDF.js.
+
+More on how parsing and scoring work, and where the thresholds live, in
+**[AUTO_REVIEW.md](AUTO_REVIEW.md)**.
 
 ---
 
@@ -118,17 +155,36 @@ Then run the schema:
 
 ```
 Serotonin-public/
+├── amplify/                    ← backend as TypeScript, deployed on push
+│   ├── auth/resource.ts        ← Cognito user pool + identity pool
+│   ├── data/resource.ts        ← 8 models + the embedTexts mutation
+│   ├── storage/resource.ts     ← S3 bucket, per-identity prefixes
+│   ├── functions/embed-text/   ← Bedrock Titan embeddings (Lambda)
+│   └── backend.ts
 ├── src/
-│   ├── Serotonin.jsx   ← the whole app (single-file SPA, ~3,900 lines)
-│   ├── main.jsx        ← mounts the app, no auth wrapper in demo mode
+│   ├── Serotonin.jsx           ← the whole app (single-file SPA, ~4,300 lines)
+│   ├── main.jsx                ← mounts the app
 │   └── lib/
-│       ├── supabase.js ← client init (returns null without .env)
-│       └── useAuth.js  ← auth state hook
-├── docs/
-│   └── supabase_schema.sql
+│       ├── amplifyClient.js    ← configure Amplify, resolve owner + identity
+│       ├── collections.js      ← UI shape ⇄ data model mapping
+│       ├── store.js            ← async CRUD, AWS or on-device, + migration
+│       ├── files.js            ← S3 uploads, or IndexedDB with no backend
+│       ├── usePersisted.js     ← the hooks the components call
+│       ├── extract.js          ← PDF.js / Mammoth / CSV text extraction
+│       ├── questionExtract.js  ← finds questions in raw document text
+│       ├── chunk.js            ← splits documents into citable passages
+│       ├── textIndex.js        ← tokeniser, GRC synonyms, BM25, cosine
+│       ├── embeddings.js       ← Bedrock embedding client + cache
+│       ├── matcher.js          ← hybrid scoring and classification
+│       ├── kbIndex.js          ← indexing, coverage, backfill
+│       ├── supabase.js         ← dormant (see AMPLIFY_SETUP.md)
+│       └── useAuth.js          ← dormant
+├── tests/                      ← extraction · matching · persistence · auto-review
+├── amplify.yml                 ← Amplify build spec (backend + frontend)
+├── customHttp.yml              ← security headers
+├── AMPLIFY_SETUP.md            ← deployment + the auth to-do list
+├── AUTO_REVIEW.md              ← how parsing, scoring and citation work
 ├── index.html
-├── vercel.json         ← security headers
-├── .env.example
 └── package.json
 ```
 
@@ -140,7 +196,7 @@ I'm a Security Engineer moving into detection engineering. I kept watching GRC w
 
 The questionnaire problem is a perfect automation target: highly repetitive, well-defined inputs and outputs, clear quality criteria (confidence scoring), and meaningful time savings when you get it right. Building this taught me more about practical security automation than any cert has — threat modeling a real app, implementing HIPAA controls that aren't just checkboxes, designing RLS policies that actually hold up, and thinking through what "secure by default" looks like at the application layer.
 
-The full production version (with auth, domain locking, invite-only access, and Supabase connected) is not available. This is the cleaned-up public demo.
+The full production version (with auth, domain locking and invite-only access) is not available. This is the cleaned-up public demo.
 
 ---
 
