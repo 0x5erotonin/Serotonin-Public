@@ -3,27 +3,42 @@ version: 1
 # AWS Amplify Hosting build spec.
 #
 # The `backend` phase runs first and is what provisions Cognito, AppSync,
-# DynamoDB and S3 from the TypeScript definitions in amplify/. It also writes
-# amplify_outputs.json into the repo root, which the frontend build then picks
-# up — so the ordering here matters: the frontend cannot know its endpoints
-# until pipeline-deploy has run.
+# DynamoDB, S3 and the embedding Lambda from the TypeScript definitions in
+# amplify/. It also writes amplify_outputs.json into the repo root, which the
+# frontend build then picks up — so the ordering here matters: the frontend
+# cannot know its endpoints until pipeline-deploy has run.
 #
 # On a branch with no backend permissions (a preview build, a fork), the backend
 # phase fails, amplify_outputs.json is never written, and the app falls back to
 # on-device storage rather than shipping broken. That is deliberate.
+#
+# ─── ON `npm ci` vs `npm install` ────────────────────────────────────────────
+# `npm ci` is the right command for CI — it installs exactly what the lockfile
+# says — but it *requires* package-lock.json and fails outright without one.
+# This repo has no lockfile committed yet, so both phases fall back to
+# `npm install`.
+#
+# Commit a lockfile when you can (`npm install && git add package-lock.json`):
+# builds then become reproducible, and this spec will use `npm ci` automatically.
+#
+# `--include=dev` is explicit because the backend needs devDependencies —
+# @aws-amplify/backend, the CDK libs and the Bedrock SDK the Lambda bundles — and
+# a build environment that sets NODE_ENV=production would otherwise skip them and
+# fail on `npx ampx`.
+# ─────────────────────────────────────────────────────────────────────────────
 
 backend:
   phases:
     build:
       commands:
-        - npm ci --cache .npm --prefer-offline
+        - if [ -f package-lock.json ]; then npm ci --include=dev --cache .npm --prefer-offline; else npm install --include=dev --cache .npm --prefer-offline; fi
         - npx ampx pipeline-deploy --branch $AWS_BRANCH --app-id $AWS_APP_ID
 
 frontend:
   phases:
     preBuild:
       commands:
-        - npm ci --cache .npm --prefer-offline
+        - if [ -f package-lock.json ]; then npm ci --include=dev --cache .npm --prefer-offline; else npm install --include=dev --cache .npm --prefer-offline; fi
     build:
       commands:
         - npm run build
