@@ -2,21 +2,41 @@ version: 1
 
 # AWS Amplify Hosting build spec.
 #
-# The `backend` phase runs first and is what provisions Cognito, AppSync,
-# DynamoDB, S3 and the embedding Lambda from the TypeScript definitions in
-# amplify/. It also writes amplify_outputs.json into the repo root, which the
-# frontend build then picks up — so the ordering here matters: the frontend
-# cannot know its endpoints until pipeline-deploy has run.
+# The `backend` phase provisions Cognito, AppSync, DynamoDB, S3 and the embedding
+# Lambda from the TypeScript definitions in amplify/. It also writes
+# amplify_outputs.json into the repo root, which the frontend build picks up — so
+# the ordering matters: the frontend cannot know its endpoints until
+# pipeline-deploy has run.
 #
-# On a branch with no backend permissions (a preview build, a fork), the backend
-# phase fails, amplify_outputs.json is never written, and the app falls back to
-# on-device storage rather than shipping broken. That is deliberate.
+# ─── WHY THE BACKEND PHASE DOES NOT FAIL THE BUILD ───────────────────────────
+# `pipeline-deploy` is followed by `|| echo …`, so a backend failure is logged
+# loudly but does not abort the build.
+#
+# That is deliberate, and it follows from how the app is written: with no
+# amplify_outputs.json it runs on durable on-device storage and keyword-only
+# matching. Every feature works; nothing syncs across devices. So a broken
+# backend deploy has two possible outcomes —
+#
+#   fail the build   → nothing deploys at all, the site keeps serving the old
+#                      build, and you cannot even look at the frontend
+#   carry on         → the site deploys and works, degraded, and says so in the
+#                      Storage & Security panel
+#
+# — and the second is strictly better while the backend is still being brought
+# up. The frontend build is NOT forgiving in the same way: a compile error there
+# does fail the build, because a frontend that does not compile has no degraded
+# mode to fall back to.
+#
+# WHEN THE BACKEND IS WORKING, make it strict again by deleting the `|| echo …`
+# from the pipeline-deploy line. Otherwise a regression in the backend will
+# deploy silently and every user will quietly drop to device-only storage.
+# Check the build log for the banner below, and check the app's Storage &
+# Security panel, which reports which backend is actually live.
 #
 # ─── ON `npm ci` vs `npm install` ────────────────────────────────────────────
 # `npm ci` is the right command for CI — it installs exactly what the lockfile
-# says — but it *requires* package-lock.json and fails outright without one.
-# This repo has no lockfile committed yet, so both phases fall back to
-# `npm install`.
+# says — but it *requires* package-lock.json and fails outright without one. This
+# repo has no lockfile committed yet, so both phases fall back to `npm install`.
 #
 # Commit a lockfile when you can (`npm install && git add package-lock.json`):
 # builds then become reproducible, and this spec will use `npm ci` automatically.
@@ -32,7 +52,9 @@ backend:
     build:
       commands:
         - if [ -f package-lock.json ]; then npm ci --include=dev --cache .npm --prefer-offline; else npm install --include=dev --cache .npm --prefer-offline; fi
-        - npx ampx pipeline-deploy --branch $AWS_BRANCH --app-id $AWS_APP_ID
+        - npm ls @aws-amplify/backend @aws-amplify/backend-cli aws-cdk-lib --depth=0 || true
+        - npx ampx pipeline-deploy --branch $AWS_BRANCH --app-id $AWS_APP_ID || echo "=== BACKEND DEPLOY FAILED — see the error above. The frontend will still build and run on on-device storage. Fix the backend, then remove the '|| echo' from amplify.yml to make this strict again. ==="
+        - if [ -f amplify_outputs.json ]; then echo "amplify_outputs.json written — the app will use AWS."; else echo "NO amplify_outputs.json — the app will use on-device storage only."; fi
 
 frontend:
   phases:
