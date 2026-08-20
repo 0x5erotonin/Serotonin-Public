@@ -202,8 +202,9 @@ const schema = a.schema({
       dimensions: a.integer(),
     })
     .returns(a.json())
-    .handler(a.handler.function(embedText))
-    .authorization((allow) => [allow.guest(), allow.authenticated()]),
+    // .authorization() before .handler(), matching the documented chain order.
+    .authorization((allow) => [allow.guest(), allow.authenticated()])
+    .handler(a.handler.function(embedText)),
 
   /** Append-only action history. Nothing in the UI deletes from this. */
   AuditLog: a

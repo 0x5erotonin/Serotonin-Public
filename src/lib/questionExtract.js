@@ -39,7 +39,7 @@ const BULLET = /^\s*[•▪◦‣·*+–—-]\s+/;
 const INTERROGATIVE = /^(do|does|did|is|are|was|were|has|have|had|can|could|will|would|should|shall|may|must|if|who|what|when|where|why|how|which|please|describe|explain|provide|list|specify|identify|confirm|indicate|state|detail|outline|summarize|summarise|attach|upload|document|demonstrate)\b/i;
 
 /** Phrases that signal a requirement even mid-sentence. */
-const REQUIREMENT = /\b(do you|does your|are you|is your|have you|has your|can you|will you|please (?:describe|explain|provide|list|specify|confirm|attach|indicate|detail)|describe your|explain your|provide (?:a|the|your|evidence|details)|list (?:all|any|the|your)|indicate whether|confirm (?:that|whether)|specify (?:the|your|how)|how (?:do|does|are|is|many|often)|what (?:is|are|type|kind)|who (?:is|are|has)|where (?:is|are|do)|evidence of|documentation (?:of|for)|attach (?:a|the|your))\b/i;
+const REQUIREMENT = /\b(do you|does your|are you|is your|have you|has your|can you|will you|please (?:describe|explain|provide|list|specify|confirm|attach|indicate|detail)|describe (?:your|how|the|any|briefly|in detail)|explain (?:your|how|the|why|any)|provide (?:a|the|your|evidence|details)|list (?:all|any|the|your)|indicate (?:whether|how|if)|confirm (?:that|whether)|specify (?:the|your|how)|outline (?:your|the|how)|summari[sz]e (?:your|the|how)|how (?:do|does|are|is|many|often)|what (?:is|are|type|kind)|who (?:is|are|has)|where (?:is|are|do)|evidence of|documentation (?:of|for)|attach (?:a|the|your))\b/i;
 
 /** Section headings and page furniture that are never questions. */
 const BOILERPLATE =
@@ -305,6 +305,21 @@ function dedupe(items) {
   }
   // Map preserves insertion order, so document order survives.
   return [...seen.values()];
+}
+
+/**
+ * Score a single string on how question-shaped it is.
+ *
+ * Exported so the spreadsheet path (src/lib/gridQuestions.js) can pick the
+ * question column using exactly the same signals as the text path, instead of
+ * duplicating the regexes and letting the two definitions drift apart.
+ *
+ * @returns { text, score, signals } — score is roughly -6..+6
+ */
+export function scoreLine(text) {
+  const line = String(text || '').trim();
+  if (!line) return { text: '', score: -5, signals: ['empty'] };
+  return scoreItem({ raw: line, marker: null, extra: [] });
 }
 
 /**

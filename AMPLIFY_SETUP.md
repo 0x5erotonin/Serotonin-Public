@@ -124,6 +124,47 @@ whole UI is built from inline styles and a token system rather than a stylesheet
 
 ---
 
+## Troubleshooting the build
+
+**`npm error code EUSAGE` — "The `npm ci` command can only install with an
+existing package-lock.json"**
+
+`npm ci` is the correct command for CI, but it refuses to run without a
+lockfile, and none was committed. Two fixes, and the first is better:
+
+```bash
+# 1. Commit a lockfile (also makes every future build reproducible)
+npm install
+git add package-lock.json && git commit -m "Add package-lock.json" && git push
+```
+
+Or rely on the fallback now in `amplify.yml`, which uses `npm ci` when a lockfile
+exists and `npm install` when it does not. Either unblocks the build; committing
+the lockfile additionally pins exact versions, which is what you want for a
+security tool — without it, a transitive dependency can change between builds
+with no diff to review.
+
+**The backend phase fails on `npx ampx` with a missing module**
+
+The backend needs devDependencies (`@aws-amplify/backend`, the CDK libraries, the
+Bedrock SDK the Lambda bundles). `amplify.yml` passes `--include=dev` explicitly
+so a build environment that sets `NODE_ENV=production` cannot skip them.
+
+**`Failed to set up process.env.secrets`**
+
+Benign. It means no Amplify secrets are configured, which this app does not need
+until Google SSO is wired up.
+
+**The frontend builds but the app runs on device-only storage**
+
+`amplify_outputs.json` was never written, which means the backend phase did not
+finish. Check the build log for the `pipeline-deploy` step and confirm the service
+role has backend deploy permissions (step 2 above). This is deliberate behaviour —
+a failed backend deploy degrades to on-device storage rather than shipping a
+broken app — but it is not what you want in production.
+
+---
+
 ## Local development
 
 ```bash
@@ -251,11 +292,15 @@ edits and the theme all survive a refresh:
 
 ```bash
 npm install
-npx playwright install chromium
+npm i -D playwright && npx playwright install chromium
 npm run build
 npm run preview &                  # serves dist/ on :4173
 node tests/persistence.spec.mjs
 ```
+
+Playwright is intentionally not a dependency: some versions download ~150MB of
+browsers on install, which would run on every Amplify build and is never used
+there.
 
 It runs against the on-device path, which exercises every store and hook seam
 the AWS path also uses. Run it after `npx ampx sandbox` to cover the AWS path

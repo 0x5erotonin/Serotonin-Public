@@ -16,10 +16,10 @@ questions."*
  upload
    │
    ├─ 1. extract text          src/lib/extract.js
-   │      PDF.js · Mammoth · CSV/TSV · TXT/MD
+   │      PDF.js · Mammoth · xlsx.js · CSV/TSV · TXT/MD
    │
-   ├─ 2. find the questions    src/lib/questionExtract.js
-   │      score candidate lines, strip markers, de-duplicate
+   ├─ 2. find the questions    a spreadsheet → gridQuestions.js (which column?)
+   │                           anything else → questionExtract.js (which lines?)
    │
    ├─ 3. score against the KB  src/lib/matcher.js
    │      ├─ lexical   BM25 + coverage + phrase bonus   src/lib/textIndex.js
@@ -40,20 +40,92 @@ policy documents on import and completed questionnaires on completion.
 |---|---|
 | `.pdf` | PDF.js, page by page, keeping page numbers for citations |
 | `.docx` | Mammoth (`extractRawText`) |
+| `.xlsx` `.xlsm` | `src/lib/xlsx.js` — no dependency, see below |
 | `.csv` `.tsv` | Parsed as a grid so table rows survive as rows |
 | `.txt` `.md` | Read directly |
 
-Both parsers load via dynamic `import()`, so they are code-split — PDF.js is over
-a megabyte and someone who only pastes text never downloads it.
+PDF.js and Mammoth load via dynamic `import()`, so they are code-split — PDF.js is
+over a megabyte and someone who only pastes text never downloads it.
 
-**Two honest failure modes.** A scanned PDF has no text layer: pages parse and
-produce nothing, and the app says so rather than reporting "0 questions found"
-(OCR would need Textract or tesseract.js). And `.xlsx` is not parsed — that needs
-SheetJS — so the error tells you to export the sheet as CSV, which is supported.
-Since SIG and CAIQ commonly arrive as spreadsheets, that is the most likely thing
-to add next.
+**A scanned PDF has no text layer**: pages parse and produce nothing, and the app
+says so rather than reporting "0 questions found". OCR would need Textract or
+tesseract.js. Legacy `.xls` is a binary format from before the ZIP era and errors
+with an instruction to re-save as `.xlsx`.
 
-## 2. Finding the questions
+### Why the spreadsheet reader has no dependency
+
+The obvious choice is SheetJS, and it is the wrong one here. The `xlsx` package on
+npm is pinned at 0.18.5 and carries **CVE-2023-30533** (prototype pollution) plus
+a ReDoS advisory. The fix shipped in 0.19.3, which was never published to npm —
+SheetJS moved to distributing from their own CDN. So the options were a tarball URL
+as a dependency, or a known-vulnerable package that Dependabot would flag forever
+in a tool whose entire job is answering *"do you monitor your dependencies?"*
+
+Neither appealed, and reading a questionnaire needs a fraction of what SheetJS
+does. So `src/lib/unzip.js` (~200 lines) and `src/lib/xlsx.js` (~300 lines) do it
+directly:
+
+- **Unzipping** uses the platform's own `DecompressionStream('deflate-raw')` — no
+  inflate implementation to carry or audit. Available in every browser since
+  Safari 16.4, and in Node, which is why the parser is unit-testable without a
+  browser.
+- **XML** is read with a linear `indexOf` scanner rather than `DOMParser` or
+  regexes. Sheet XML is machine-generated and highly regular, so scanning is both
+  simpler and strictly linear — and after the response-column regex in
+  `questionExtract.js` turned out to be quadratic on real uploads, a parser with
+  no backtracking at all seemed like the right default for code that reads
+  untrusted files.
+
+Scope is cell *text*, which is all a questionnaire needs: shared strings, inline
+strings, rich-text runs, formula cached results, booleans, sheet names and hidden
+flags. Styles, charts, images and pivot tables are ignored. Date cells come
+through as their serial number, because resolving them means parsing `styles.xml`
+and the number-format table — worth doing only if dates ever matter.
+
+Bounded on purpose, since the input is untrusted: 20,000 rows per sheet, 256
+columns, 60 sheets, 64 MB per decompressed entry. A workbook that exceeds a limit
+is truncated with a warning rather than refused.
+
+## 2. Finding the questions in a spreadsheet
+
+A real SIG or CAIQ workbook is not a list of questions. It is a cover page, an
+instructions tab, a glossary, the questionnaire itself, and often an old version
+somebody forgot to delete. On the questionnaire sheet the question is rarely in
+column A — it sits to the right of a control ID and a domain, with empty response
+and comment columns after it.
+
+So `src/lib/gridQuestions.js` treats it as a structural problem:
+
+1. **Skip sheets that are not questionnaires** — by name (`Instructions`,
+   `Glossary`, `Revision History`, …) and by having nothing question-shaped in
+   them. Name-based skipping only applies when something else remains, so a
+   workbook whose only sheet is called "Reference" is still read.
+2. **Find the header row**, which is frequently not row 1 — the first row within
+   the first 25 that has at least two header-like cells.
+3. **Score every column** using the same `scoreLine` the text path uses, then
+   pick the best. A header cell reading "Question" adds 3; one reading "Comments"
+   subtracts 3, because a column's title is a stronger signal than its contents.
+4. **Report what it chose**, in a sentence:
+
+> Found 10 questions in sig-questionnaire.xlsx — used 10 from column C
+> ("Question") of "Full Questionnaire" — skipped "Old Version 2024" (hidden
+> sheet), "Instructions" (looks like guidance), "Glossary" (looks like a
+> glossary).
+
+Step 4 matters as much as the rest. Auto-detection is invisible when it works and
+baffling when it does not, so the analyst always gets told which sheet and column
+were used — that is the decision most likely to be wrong and the hardest to guess
+at from the results.
+
+Row numbers in the report are the ones Excel shows. Blank rows are dropped during
+parsing rather than padded (a sheet with one entry at row 10,000 should not
+allocate 10,000 arrays), so real row numbers are tracked alongside the array
+rather than inferred from its index.
+
+If no column stands out, it falls back to joining each row into a line — the same
+treatment CSV gets.
+
+## 3. Finding the questions in text
 
 Questionnaires are not structured data. They arrive as numbered lists, lettered
 sub-items, control-ID tables, CSV grids, or prose — often several in one file. So
@@ -72,7 +144,7 @@ candidate lines are *scored* rather than pattern-matched:
 format that broke an earlier version. Worth reading before you tune the
 heuristics.
 
-## 3. Scoring
+## 4. Scoring
 
 Each candidate gets two independent scores in 0..1, and they are combined as:
 
@@ -103,7 +175,7 @@ the formula degrades to plain lexical with no special-casing.
 **Semantic** is Amazon Titan Text Embeddings V2 at 256 dimensions, computed by a
 Lambda (`amplify/functions/embed-text/`) and compared with cosine similarity.
 
-## 4. Classification
+## 5. Classification
 
 | Source | Score | Outcome |
 |---|---|---|
@@ -204,13 +276,24 @@ Lexical matching is free and runs in the browser.
 ## Testing
 
 ```bash
-npm run test:unit     # extraction + matching, plain Node, no browser
-npm test              # the above, plus both browser suites
+npm test              # extraction + matching, plain Node, no browser
+
+# The browser suites need Playwright, which is deliberately not a dependency —
+# it downloads ~150MB of browsers and the deploy build has no use for it.
+npm i -D playwright && npx playwright install chromium
+npm run build && npm run preview &
+npm run test:browser
 ```
 
 - `tests/extraction.spec.mjs` — six real questionnaire formats, chunking, and
   regression tests for a whitespace pattern that used to take 67 seconds on an
   ordinary file.
+- `tests/xlsx.spec.mjs` — the ZIP reader (including stored entries, missing
+  entries, non-archives), shared strings, rich-text runs, out-of-order and sparse
+  cells, a SIG-shaped workbook with instruction/glossary/hidden tabs, a sheet with
+  no header row, a question column sitting to the right of a longer guidance
+  column, and a 3,000-row performance bound. Fixtures are generated by
+  `npm run fixtures`, which writes the XML by hand so these shapes are exact.
 - `tests/matching.spec.mjs` — lexical-only, hybrid with synthetic embeddings, thin
   evidence, corrupt vectors, dimension mismatch, and a 1,200-passage performance
   bound.

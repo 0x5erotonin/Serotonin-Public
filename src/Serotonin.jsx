@@ -15,6 +15,7 @@ import { uploadFile, removeFile, openFile, getFileUrl, formatBytes } from './lib
 import { isAmplifyConfigured, whenReady } from './lib/amplifyClient.js';
 import { extractText, SUPPORTED_LABEL } from './lib/extract.js';
 import { extractQuestions, questionsFromLines } from './lib/questionExtract.js';
+import { questionsFromSheets, describeReport } from './lib/gridQuestions.js';
 import { autoReview } from './lib/matcher.js';
 import {
   loadChunks, indexDocument, indexQaPairs, removeChunksFor,
@@ -966,20 +967,34 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft
         return;
       }
 
-      const { questions: found, stats } = extractQuestions(parsed.text, { sourceName: file.name });
+      // A workbook is a structural problem, not a text one: the question sits in
+      // one column of one sheet, alongside instruction and glossary tabs. So the
+      // spreadsheet path uses the grid rather than the flattened text.
+      let found;
+      let summary;
+      if (Array.isArray(parsed.sheets) && parsed.sheets.length > 0) {
+        const { questions, report } = questionsFromSheets(parsed.sheets);
+        found = questions;
+        // Auto-detection is invisible when it works and baffling when it does
+        // not, so always say which sheet and column were used.
+        summary = describeReport(report, file.name);
+      } else {
+        const { questions, stats } = extractQuestions(parsed.text, { sourceName: file.name });
+        found = questions;
+        summary = `Found ${questions.length} question${questions.length !== 1 ? 's' : ''} in ${file.name}${parsed.pages.length > 1 ? ` (${parsed.pages.length} pages)` : ''}.`;
+        if (questions.length === 0) {
+          summary = `No questions found in ${file.name}. It scanned ${stats.lines} lines. If the questions are in a table, try uploading the spreadsheet itself, or paste them in manually.`;
+        }
+      }
+
       if (found.length === 0) {
-        setExtractNotice({
-          kind: 'error',
-          message:
-            parsed.warnings?.[0] ||
-            `No questions found in ${file.name}. It scanned ${stats.lines} lines. If the questions are in a table, try exporting that sheet as CSV, or paste them in manually.`,
-        });
+        setExtractNotice({ kind: 'error', message: parsed.warnings?.[0] || summary });
         return;
       }
 
       setExtractNotice({
         kind: 'ok',
-        message: `Found ${found.length} question${found.length !== 1 ? 's' : ''} in ${file.name}${parsed.pages.length > 1 ? ` (${parsed.pages.length} pages)` : ''}.${parsed.warnings?.length ? ` ${parsed.warnings[0]}` : ''}`,
+        message: `${summary}${parsed.warnings?.length ? ` ${parsed.warnings[0]}` : ''}`,
       });
       await startProcessing(found);
     } catch (err) {
@@ -1162,7 +1177,7 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft
             >
               <input
                 type="file"
-                accept=".pdf,.docx,.doc,.xlsx,.xls,.csv,.tsv,.txt,.md"
+                accept=".pdf,.docx,.xlsx,.xlsm,.csv,.tsv,.txt,.md,.doc,.xls"
                 style={{ display: 'none' }}
                 disabled={parsingFile}
                 onChange={e => {
@@ -2366,7 +2381,7 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
             <input
               type="file"
               multiple
-              accept=".pdf,.docx,.doc,.xlsx,.xls,.pptx,.txt,.csv"
+              accept=".pdf,.docx,.xlsx,.xlsm,.csv,.tsv,.txt,.md,.doc,.xls,.pptx"
               style={{ display: 'none' }}
               onChange={e => {
                 const files = Array.from(e.target.files);

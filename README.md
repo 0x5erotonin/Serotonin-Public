@@ -23,11 +23,13 @@ Then it happens again next month. And the month after that.
 
 ## ✨ What it does
 
-**📋 Complete questionnaires** — Upload the PDF, DOCX or CSV a vendor sent you and Serotonin reads it: pulls the questions out, then checks each one against everything you've answered before and every policy document you've imported. Questions you've answered before come back auto-filled and attributed. Questions your SOC 2 report covers come back with the paragraph cited, for you to accept in a click. The rest are flagged as needing a real answer — and it tells you what the closest near-miss was. Five-step workflow: import → auto-review → review → approve → send.
+**📋 Complete questionnaires** — Upload the PDF, DOCX or Excel workbook a vendor sent you and Serotonin reads it, pulls the questions out, and checks each one against everything you've answered before and every policy document you've imported. Questions you've answered before come back auto-filled and attributed. Questions your SOC 2 report covers come back with the paragraph cited, for you to accept in a click. The rest are flagged as needing a real answer — and it tells you what the closest near-miss was. Five-step workflow: import → auto-review → review → approve → send.
+
+**📊 It handles the spreadsheets** — A SIG or CAIQ workbook is a cover page, an instructions tab, a glossary, the questionnaire, and usually an old version nobody deleted. Serotonin works out which sheet is the questionnaire and which column holds the questions — they're rarely in column A — skips the rest, and tells you exactly what it picked: *"used column C ("Question") of "Full Questionnaire" — skipped "Instructions" (looks like guidance), "Glossary" (looks like a glossary)"*.
 
 **🧠 Knowledge base** — Every questionnaire you complete gets indexed and searchable, and so does every policy document you import: SOC 2 reports, access control policies, disaster recovery plans are split into passages, embedded, and cited by page. Genuinely gets better with every questionnaire you run through it, because your own answers become the best match for next time.
 
-**📊 Dashboard** — See everything in flight at a glance. Who owns what, where it's at in the workflow, how complete it is, who it's assigned to. One click to pick up where you left off.
+**🗂 Dashboard** — See everything in flight at a glance. Who owns what, where it's at in the workflow, how complete it is, who it's assigned to. One click to pick up where you left off.
 
 **📖 Internal wiki** — Full documentation built directly into the app. 16 articles covering every feature, security posture, tips, and troubleshooting. No external Notion or Confluence required.
 
@@ -47,6 +49,7 @@ No UI framework. No component library. Just React, inline styles, and a semantic
 | Styling | Inline styles + CSS tokens | Full theme control, zero bundle cost |
 | Database | Amplify Data → AppSync + DynamoDB | Schema defined in TypeScript, deploys on push |
 | Parsing | PDF.js + Mammoth, client-side | No upload round-trip; works with no backend attached |
+| Spreadsheets | Own reader, zero dependencies | npm's `xlsx` is stuck on a version with an unpatched CVE |
 | Matching | BM25 in-browser + Bedrock Titan embeddings | Either signal alone can carry a match |
 | Storage | Amplify Storage → S3 | Policy documents, attachments, avatars |
 | Auth | Cognito (provisioned, not yet enforced) | See the security note below |
@@ -78,8 +81,10 @@ Browser (React SPA)
     ├── Theme system →  5 themes × semantic color tokens
     │
     ├── src/lib/  ── the auto-review pipeline
-    │       extract.js → questionExtract.js → matcher.js
-    │       (PDF.js/Mammoth)   (find questions)   (BM25 + embeddings)
+    │       extract.js  →  questionExtract.js  →  matcher.js
+    │       PDF.js            (which lines?)      BM25 + embeddings
+    │       Mammoth       gridQuestions.js
+    │       xlsx.js/unzip.js  (which column?)
     │
     └── src/lib/  ── the persistence seam
             │         store.js · collections.js · files.js · usePersisted.js
@@ -136,13 +141,18 @@ settings you need to flip, in **[AMPLIFY_SETUP.md](AMPLIFY_SETUP.md)**.
 ### Tests
 
 ```bash
-npx playwright install chromium
+npm test                      # extraction + matching, plain Node, no browser
+
+# The browser suites need Playwright, which is deliberately not a dependency —
+# it downloads ~150MB of browsers and the deploy build has no use for it.
+npm i -D playwright && npx playwright install chromium
 npm run build && npm run preview &
-npm test
+npm run test:browser
 ```
 
-`test:unit` runs the extraction and matching logic in plain Node — six real
-questionnaire formats, hybrid scoring, and performance bounds. `npm test` adds two
+`test:unit` runs the extraction, matching and spreadsheet logic in plain Node —
+six real questionnaire formats, a SIG-shaped workbook, hybrid scoring, and
+performance bounds. `npm test` adds two
 browser suites: one asserting that everything survives a refresh, one driving a
 real PDF through the whole auto-review chain with the real PDF.js.
 
@@ -170,8 +180,11 @@ Serotonin-public/
 │       ├── store.js            ← async CRUD, AWS or on-device, + migration
 │       ├── files.js            ← S3 uploads, or IndexedDB with no backend
 │       ├── usePersisted.js     ← the hooks the components call
-│       ├── extract.js          ← PDF.js / Mammoth / CSV text extraction
+│       ├── extract.js          ← PDF.js / Mammoth / xlsx / CSV extraction
+│       ├── unzip.js            ← ZIP reader over DecompressionStream
+│       ├── xlsx.js             ← .xlsx → sheets of cell text, no deps
 │       ├── questionExtract.js  ← finds questions in raw document text
+│       ├── gridQuestions.js    ← finds the question column in a workbook
 │       ├── chunk.js            ← splits documents into citable passages
 │       ├── textIndex.js        ← tokeniser, GRC synonyms, BM25, cosine
 │       ├── embeddings.js       ← Bedrock embedding client + cache

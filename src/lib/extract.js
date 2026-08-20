@@ -7,25 +7,30 @@
  *
  *   .pdf            PDF.js, page by page, preserving line breaks and page numbers
  *   .docx           Mammoth (raw text)
+ *   .xlsx .xlsm     src/lib/xlsx.js — no dependency, see that file for why
  *   .txt .md        read directly
- *   .csv .tsv       parsed as a grid, so questionnaire spreadsheets exported to
- *                   CSV keep their row structure for the question extractor
+ *   .csv .tsv       parsed as a grid, so a questionnaire exported to CSV keeps
+ *                   its row structure for the question extractor
  *
- * Both parsers are pulled in with dynamic `import()` so they are code-split:
- * PDF.js alone is over a megabyte, and someone who only pastes text never
- * downloads it.
+ * PDF.js and Mammoth are pulled in with dynamic `import()` so they are
+ * code-split: PDF.js alone is over a megabyte, and someone who only pastes text
+ * never downloads it. The xlsx reader is small enough to import directly.
+ *
+ * A spreadsheet result additionally carries `sheets`, the parsed grid, because
+ * finding questions in a workbook is a structural problem rather than a text one
+ * — see src/lib/gridQuestions.js. `text` is still populated, so the knowledge
+ * base can index a spreadsheet as passages like any other document.
  *
  * Two limitations worth being explicit about rather than failing silently:
  *
  *   • A scanned or image-only PDF contains no text layer. We detect that (pages
  *     parse, produce nothing) and say so, rather than reporting "0 questions
  *     found". OCR would need Textract or tesseract.js.
- *   • .xlsx/.xls are not parsed — that needs SheetJS. Since real questionnaires
- *     (SIG, CAIQ) often arrive as spreadsheets, the error tells the user to
- *     export the sheet as CSV, which is supported.
+ *   • Legacy .xls is a binary format that predates the ZIP-based one and is not
+ *     readable here; the error says to re-save as .xlsx.
  */
 
-/** Result: { text, pages, kind, warnings[], error }. `text` is '' on failure. */
+/** Result: { text, pages, sheets?, kind, warnings[], error }. `text` is '' on failure. */
 export async function extractText(file) {
   const name = file?.name || 'document';
   const kind = detectKind(name, file?.type);
@@ -44,21 +49,23 @@ export async function extractText(file) {
       case 'delimited':
         return { ...base, ...(await extractDelimited(file, name)) };
       case 'spreadsheet':
-        return {
-          ...base,
-          error:
-            'Excel files are not parsed yet. Open the sheet, "Save As" or export it as CSV, and upload that instead — CSV questionnaires are parsed row by row.',
-        };
+        return { ...base, ...(await extractSpreadsheet(file)) };
       case 'legacy-doc':
         return {
           ...base,
           error:
             'Legacy .doc files use a binary format that cannot be read in the browser. Open it in Word and save as .docx.',
         };
+      case 'legacy-xls':
+        return {
+          ...base,
+          error:
+            'Legacy .xls files use a binary format that predates the readable one. Open it in Excel and save as .xlsx.',
+        };
       default:
         return {
           ...base,
-          error: `Unsupported file type "${name.split('.').pop()}". Supported: PDF, DOCX, TXT, MD, CSV, TSV.`,
+          error: `Unsupported file type "${name.split('.').pop()}". Supported: ${SUPPORTED_LABEL}.`,
         };
     }
   } catch (err) {
@@ -80,7 +87,10 @@ function detectKind(name, mimeType) {
   if (ext === 'docx' || mime.includes('wordprocessingml')) return 'docx';
   if (ext === 'doc' || mime === 'application/msword') return 'legacy-doc';
   if (ext === 'csv' || ext === 'tsv') return 'delimited';
-  if (ext === 'xlsx' || ext === 'xls' || mime.includes('spreadsheetml')) return 'spreadsheet';
+  if (ext === 'xls') return 'legacy-xls';
+  if (ext === 'xlsx' || ext === 'xlsm' || ext === 'xltx' || mime.includes('spreadsheetml')) {
+    return 'spreadsheet';
+  }
   if (ext === 'txt' || ext === 'md' || ext === 'text' || mime.startsWith('text/')) return 'text';
   return 'unknown';
 }
@@ -300,8 +310,54 @@ function normaliseWhitespace(text) {
     .trim();
 }
 
+/* ── Spreadsheets ─────────────────────────────────────────────────────────── */
+
+/**
+ * Parse a workbook into both a grid and text.
+ *
+ * The grid (`sheets`) is what the question extractor wants — a question lives in
+ * a particular column of a particular sheet. The text is what the knowledge base
+ * wants, so a spreadsheet imported as a policy document (a risk register, a
+ * control matrix) can be chunked and cited like anything else.
+ *
+ * Each sheet becomes one "page", numbered in tab order, and its text is prefixed
+ * with the sheet name so a cited passage still says where it came from without
+ * needing a new field on the index.
+ */
+async function extractSpreadsheet(file) {
+  const { parseXlsx } = await import('./xlsx.js');
+  const { sheets, warnings } = await parseXlsx(await file.arrayBuffer());
+
+  const pages = sheets.map((sheet, index) => ({
+    page: index + 1,
+    text: sheetToText(sheet),
+  }));
+
+  const visible = sheets.filter((sheet) => !sheet.hidden);
+  if (visible.length === 0) {
+    warnings.push(`Every sheet in ${file.name} is hidden.`);
+  }
+
+  return {
+    text: pages.map((p) => p.text).filter(Boolean).join('\n\n'),
+    pages,
+    sheets,
+    warnings,
+  };
+}
+
+function sheetToText(sheet) {
+  const lines = sheet.rows
+    .map((row) => row.map((cell) => String(cell ?? '').trim()).filter(Boolean).join(' | '))
+    .filter(Boolean);
+  if (lines.length === 0) return '';
+  return [`Sheet "${sheet.name}"`, '', ...lines].join('\n');
+}
+
 /** Extensions the file picker should advertise. */
-export const SUPPORTED_EXTENSIONS = ['.pdf', '.docx', '.txt', '.md', '.csv', '.tsv'];
+export const SUPPORTED_EXTENSIONS = [
+  '.pdf', '.docx', '.xlsx', '.xlsm', '.csv', '.tsv', '.txt', '.md',
+];
 
 /** Human-readable list for empty states and hints. */
-export const SUPPORTED_LABEL = 'PDF, DOCX, TXT, MD, CSV';
+export const SUPPORTED_LABEL = 'PDF, DOCX, XLSX, CSV, TXT';
