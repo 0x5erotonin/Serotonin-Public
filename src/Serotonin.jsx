@@ -697,6 +697,25 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft
   const [assignee, setAssigneeState] = useState(saved?.assignee || '');
 
   /**
+   * Who owns this assessment.
+   *
+   * Read from the record rather than fixed to the signed-in profile, because
+   * ownership is transferable from the dashboard: hardcoding `profile.name` here
+   * meant the original owner only had to reopen a transferred questionnaire for
+   * the next autosave to silently take it back. Falls through to the profile name
+   * (live, so a late-loading profile is still picked up) for a new one.
+   */
+  const ownerName = (saved?.owner || '').trim() || profile?.name || 'You';
+
+  // Keep the owner in the on-device scratch copy too. Without this, a refresh
+  // mid-edit loses it — `saved` falls back to the scratch record, which had no
+  // owner field, and the transfer is undone by the next autosave.
+  useEffect(() => {
+    if (saved?.owner) persist({ owner: saved.owner });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /**
    * Trim a question down to what is worth persisting.
    *
    * Auto-review attaches a full cited passage to every question — exactly what
@@ -792,6 +811,10 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft
 
   // Clear saved progress when questionnaire is reset
   const clearProgress = () => {
+    // Drop any debounced patch first, or it lands 300ms later and rebuilds the
+    // scratch record we just deleted — bringing the old owner back with it.
+    if (persistTimer.current) { clearTimeout(persistTimer.current); persistTimer.current = null; }
+    pendingPatch.current = null;
     try { localStorage.removeItem(PROGRESS_KEY); } catch {}
     if (onDeleteDraft) onDeleteDraft(draftId);
     if (onReleaseAttachments) onReleaseAttachments(draftId);
@@ -819,8 +842,8 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft
     questions:    questions.map(trimQuestion),
     manualText,
     assignee,
-    owner:        profile?.name || 'You',
-    ownerInitials:(profile?.name || 'Y').split(' ').map(w => w[0]).join('').slice(0,2).toUpperCase(),
+    owner:        ownerName,
+    ownerInitials:initialsOf(ownerName),
     progress:     questions.length > 0
       ? Math.round(questions.filter(q => q.answer?.trim()).length / questions.length * 100)
       : 0,
@@ -1897,18 +1920,47 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
   };
   const [deleteConfirm, setDeleteConfirm] = useState(null); // entry to confirm-delete
 
-  // Derive tag list from real entries only
-  const allTags = [...new Set(kbEntries.flatMap(q => q.tags || []))];
+  // Tags come from both kinds of library item, so a tag on a policy document is
+  // selectable in the same filter row as one on a questionnaire.
+  const allTags = [...new Set([
+    ...kbEntries.flatMap(q => q.tags || []),
+    ...kbDocs.flatMap(d => d.tags || []),
+  ])];
+
+  const needle = search.trim().toLowerCase();
 
   const filtered = kbEntries.filter(q => {
-    const matchSearch = search === '' ||
-      q.vendor.toLowerCase().includes(search.toLowerCase()) ||
-      (q.tags || []).some(tg => tg.toLowerCase().includes(search.toLowerCase()));
+    const matchSearch = needle === '' ||
+      q.vendor.toLowerCase().includes(needle) ||
+      (q.tags || []).some(tg => tg.toLowerCase().includes(needle));
     const matchTags = selectedTags.length === 0 ||
       selectedTags.every(tg => (q.tags || []).includes(tg));
     const matchFilter = activeFilter === 'all' || q.source === 'Complete questionnaire';
     return matchSearch && matchTags && matchFilter;
   });
+
+  /**
+   * Policy documents that pass the same search and tag filters.
+   *
+   * "All entries" means all of them: a document imported into the library is a
+   * library entry, and it used to be reachable only from the Policy documents
+   * tab because the list below rendered off `filtered`, which is built from
+   * kbEntries alone. Documents are excluded from "Completed" — that tab means
+   * completed questionnaires specifically.
+   */
+  const filteredDocs = activeFilter === 'completed' ? [] : kbDocs.filter(d => {
+    const matchSearch = needle === '' ||
+      (d.name || '').toLowerCase().includes(needle) ||
+      (d.category || '').toLowerCase().includes(needle) ||
+      (d.note || '').toLowerCase().includes(needle) ||
+      (d.tags || []).some(tg => tg.toLowerCase().includes(needle));
+    const matchTags = selectedTags.length === 0 ||
+      selectedTags.every(tg => (d.tags || []).includes(tg));
+    return matchSearch && matchTags;
+  });
+
+  /** True when the "all" tab is showing both kinds, so the sections get headings. */
+  const showBothSections = activeFilter === 'all' && filteredDocs.length > 0 && filtered.length > 0;
 
   const completedCount = kbEntries.filter(q => q.source === 'Complete questionnaire').length;
   const totalQuestions = kbEntries.reduce((sum, q) => sum + (q.questions || 0), 0);
@@ -2056,7 +2108,7 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
           {/* Filter tabs */}
           <div style={{ display: 'flex', gap: 6, marginBottom: 14 }}>
             {[
-              ['all',       'All entries'],
+              ['all',       `All entries (${kbEntries.length + kbDocs.length})`],
               ['completed', `Completed (${completedCount})`],
               ['documents', `Policy documents (${kbDocs.length})`],
             ].map(([key, label]) => (
@@ -2080,7 +2132,7 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
           <div style={{ display: 'flex', gap: 10, marginBottom: 12, alignItems: 'center' }}>
             <div style={{ flex: 1, position: 'relative' }}>
               <Search size={14} color={t.text3} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)' }} />
-              <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search by vendor, tag…" style={{ ...s.input, paddingLeft: 34 }} />
+              <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search by vendor, document, tag…" style={{ ...s.input, paddingLeft: 34 }} />
             </div>
             <div style={{ display: 'flex', gap: 4, background: t.bg2, border: `0.5px solid ${t.border}`, borderRadius: 7, padding: 3 }}>
               <button onClick={() => setViewMode('grid')} style={{ width: 30, height: 30, borderRadius: 5, display: 'flex', alignItems: 'center', justifyContent: 'center', background: viewMode === 'grid' ? t.accent : 'transparent', border: 'none', cursor: 'pointer', color: viewMode === 'grid' ? '#fff' : t.dim }}><Grid size={14} /></button>
@@ -2109,8 +2161,10 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
             </div>
           )}
 
-          {activeFilter === 'documents' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 4 }}>
+          {/* Policy documents — shown on the Policy documents tab and, since a
+              document is a library entry too, on All entries. */}
+          {activeFilter !== 'completed' && (activeFilter === 'documents' || filteredDocs.length > 0) && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 4, marginBottom: showBothSections ? 22 : 0 }}>
               {kbDocs.length === 0 ? (
                 <div style={{ ...s.card, padding: '48px 24px', textAlign: 'center' }}>
                   <FileText size={32} color={t.text3} style={{ margin: '0 auto 16px' }} />
@@ -2122,14 +2176,24 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
                     <Upload size={13} />Import documents
                   </button>
                 </div>
+              ) : filteredDocs.length === 0 ? (
+                <div style={{ ...s.card, padding: '28px 24px', textAlign: 'center' }}>
+                  <div style={{ fontFamily: t.sansFont, fontSize: 13, fontWeight: 600, color: t.text2, marginBottom: 6 }}>No documents match your search</div>
+                  <div style={{ fontFamily: t.sansFont, fontSize: 12, color: t.text3 }}>
+                    {kbDocs.length} document{kbDocs.length !== 1 ? 's' : ''} in the library — try adjusting your search or tag filters.
+                  </div>
+                </div>
               ) : (
                 <>
-                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 4 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                    {showBothSections ? (
+                      <div style={s.label}>Policy documents ({filteredDocs.length})</div>
+                    ) : <span />}
                     <button onClick={() => setView('import')} style={{ ...s.accentBtn, display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
                       <Upload size={12} />Import more
                     </button>
                   </div>
-                  {kbDocs.map(doc => (
+                  {filteredDocs.map(doc => (
                     <div key={doc.id} style={{ ...s.card, padding: '14px 16px', display: 'flex', alignItems: 'flex-start', gap: 14 }}>
                       {/* Icon */}
                       <div style={{ width: 40, height: 40, borderRadius: 8, background: t.accentBg, border: `0.5px solid ${t.accent}`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
@@ -2151,6 +2215,11 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
                         </div>
                         {doc.note && (
                           <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text2, marginTop: 6, lineHeight: 1.5 }}>{doc.note}</div>
+                        )}
+                        {(doc.tags || []).length > 0 && (
+                          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+                            {doc.tags.map(tag => <span key={tag} style={s.pill(t.bg2, t.text3)}>{tag}</span>)}
+                          </div>
                         )}
                       </div>
                       {/* Open / remove */}
@@ -2183,25 +2252,32 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
             </div>
           )}
 
-          {/* Empty state for other filters */}
-          {activeFilter !== 'documents' && filtered.length === 0 && (
+          {/* Empty state for other filters.
+              On "all" this only fires when neither questionnaires nor documents
+              have anything to show — otherwise it would sit under a populated
+              document list claiming the library is empty. */}
+          {activeFilter !== 'documents' && filtered.length === 0 && filteredDocs.length === 0 && (
             <div style={{ ...s.card, padding: '48px 24px', textAlign: 'center' }}>
               <BookOpen size={32} color={t.text3} style={{ margin: '0 auto 16px' }} />
               <div style={{ fontFamily: t.sansFont, fontSize: 15, fontWeight: 600, color: t.text2, marginBottom: 8 }}>
-                {kbEntries.length === 0
+                {kbEntries.length === 0 && kbDocs.length === 0
                   ? 'No entries yet'
                   : activeFilter === 'completed' ? 'No completed documents yet' : 'No results match your search'}
               </div>
               <div style={{ fontFamily: t.sansFont, fontSize: 12, color: t.text3, lineHeight: 1.6, maxWidth: 380, margin: '0 auto' }}>
-                {kbEntries.length === 0
-                  ? 'Complete a questionnaire in the Complete questionnaire tab — it will automatically appear here when marked complete.'
+                {kbEntries.length === 0 && kbDocs.length === 0
+                  ? 'Complete a questionnaire in the Complete questionnaire tab — it will appear here when marked complete. Imported policy documents are listed here too.'
                   : 'Try adjusting your search or filters.'}
               </div>
             </div>
           )}
 
           {/* Entry cards — questionnaires */}
-          {activeFilter !== 'documents' && (
+          {activeFilter !== 'documents' && filtered.length > 0 && (
+          <div>
+          {showBothSections && (
+            <div style={{ ...s.label, marginBottom: 8 }}>Completed questionnaires ({filtered.length})</div>
+          )}
           <div style={viewMode === 'grid' ? { display: 'grid', gridTemplateColumns: 'repeat(2,1fr)', gap: 12 } : { display: 'flex', flexDirection: 'column', gap: 8 }}>
             {filtered.map(q => (
               <div key={q.id} style={{ ...s.card, padding: '16px 18px', position: 'relative' }}>
@@ -2263,6 +2339,7 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
                 )}
               </div>
             ))}
+          </div>
           </div>
           )} {/* end activeFilter !== documents */}
 
@@ -2630,11 +2707,11 @@ Resume it, then click the "Complete another" button on the final screen, or use 
 Shows all in-progress questionnaires saved as drafts. Each row shows:
 - Vendor name
 - Step badge (what stage it's at)
-- Owner and assignee
+- Owner — initials chip plus name, filled in when it's yours — and assignee
 - How long ago it was last saved
 - A progress bar showing answer completion
 
-Click any row to resume that questionnaire.
+Click any row to resume that questionnaire. The Transfer button hands ownership to someone else — see "Assigning questionnaires to team members".
 
 **Module cards**
 Quick navigation to Complete questionnaire, Incoming vendor assessments, and Batch processing.
@@ -2716,12 +2793,12 @@ A live progress bar shows the current questionnaire's completion. Stats update i
         content: `The Knowledge base is Serotonin's institutional memory. Every questionnaire you complete is automatically added here.
 
 **Three filter tabs**
-- **All entries** — everything in the library
-- **Completed** — questionnaires marked complete through the editor
-- **Policy documents** — manually imported policy and compliance documents
+- **All entries** — everything in the library, both completed questionnaires and imported policy documents, in labelled sections. The count in the tab is the two added together.
+- **Completed** — questionnaires marked complete through the editor. Documents are not listed here; this tab means completed questionnaires specifically.
+- **Policy documents** — just the manually imported policy and compliance documents
 
 **Searching**
-Type any vendor name or tag in the search bar. Results filter in real time.
+Type any vendor name, document name, category, note or tag in the search bar. Results filter in real time and apply to documents and questionnaires alike.
 
 **Tag filtering**
 Click tag chips below the search bar to filter by category (SOC 2, HIPAA, Completed, etc.)
@@ -2843,14 +2920,19 @@ When an answer is flagged for review, take the time to verify and update it. An 
         content: `Serotonin tracks ownership and assignment for every questionnaire.
 
 **Owner vs Assignee**
-- **Owner** — the person who created the questionnaire. Set automatically from your profile. Cannot be changed.
+- **Owner** — the person accountable for the questionnaire. Set from your profile when you create it, and transferable afterwards.
 - **Assignee** — the person responsible for completing it. Optional, set manually in the intake step.
 
 **Setting an assignee**
 In the intake step (Source), type a name in the "Assign to" field. This is currently a free-text field — future versions will support selecting from your team roster.
 
+**Transferring ownership**
+On the Dashboard, each row in Active assessments has a Transfer button. It offers the people already named on your assessments as owner or assignee, and a field for anyone else. The new owner's name and initials replace the old ones on the card, and the change is written to the audit log as \`questionnaire.transfer\`.
+
+What transfer does *not* do yet: move the questionnaire into someone else's account. Sign-in is provisioned but not enforced, so every browser is its own identity and records stay where they were created. Ownership is a label on the record and an audit trail, not an access change. Once Cognito auth is turned on, the same control can move the record's owner key too.
+
 **Viewing assignments on the Dashboard**
-The Active assessments panel shows both owner and assignee for every draft. This makes it easy to see at a glance who owns what and whether anything is blocked.
+The Active assessments panel shows both owner and assignee for every draft, with the owner's initials in an avatar chip — filled in when it's you, outlined when it isn't. This makes it easy to see at a glance who owns what and whether anything is blocked.
 
 **Best practice for team workflows**
 One person imports and sets up the questionnaire, assigns it to the subject matter expert for their section, then takes it back for final review and approval.`,
@@ -2902,7 +2984,10 @@ This means your knowledge base doesn't have a prior answer for this type of ques
 If the app shows "Serotonin…" and doesn't load after 5 seconds, try a hard refresh (Ctrl+Shift+R on Windows, Cmd+Shift+R on Mac). If the issue persists, your Supabase connection may be down — check the system status.
 
 **I can't see documents I uploaded**
-Uploaded policy documents appear in Knowledge base → Policy documents tab. Make sure you selected the correct filter tab.`,
+Uploaded policy documents are listed under both Knowledge base → All entries and Knowledge base → Policy documents. If neither shows them, check whether a search term or tag filter is still applied — the count in the tab label tells you how many exist regardless of the filter.
+
+**Someone else on my team can't see my documents**
+Expected, for now. Sign-in is provisioned but not enforced, so every browser gets its own identity and records are scoped to whoever created them. Nothing is shared between people yet, on any network. AMPLIFY_SETUP.md has the options for changing that.`,
       },
       {
         id: 'contact',
@@ -3227,9 +3312,57 @@ function InternalWiki({ t, s, onNavigate }) {
 
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
 
-function Dashboard({ t, s, onNavigate, kbEntries = [], drafts = [], onResumeDraft, profile }) {
+/** "Blayqe Forbes" → "BF". Shared by the dashboard and the transfer handler. */
+function initialsOf(name) {
+  const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return 'Y';
+  return parts.map(w => w[0]).join('').slice(0, 2).toUpperCase();
+}
+
+function Dashboard({ t, s, onNavigate, kbEntries = [], drafts = [], onResumeDraft, profile, onTransferOwner }) {
 
   const stepLabel = { intake: 'Source', processing: 'Processing', review: 'Review', approval: 'Approval', complete: 'Done', manual: 'Manual entry' };
+
+  // ── Ownership transfer ─────────────────────────────────────────
+  // Which card has its transfer panel open, and what is typed into it.
+  const [transferFor,   setTransferFor]   = useState(null);
+  const [transferInput, setTransferInput] = useState('');
+  const [transferNote,  setTransferNote]  = useState(null); // { vendor, to } — brief confirmation
+
+  const myName = profile?.name || 'You';
+
+  /**
+   * Candidate owners.
+   *
+   * There is no user directory to read: sign-in is provisioned but not enforced,
+   * so the app has never seen anyone but the person in front of it. These are the
+   * names that already appear on this device's own assessments — the owner and
+   * assignee fields — which is enough for the common case of handing something to
+   * a teammate you have worked with, and the free-text field covers the rest.
+   * When Cognito auth is turned on, replace this with a real user list.
+   */
+  const people = [...new Set([
+    myName,
+    ...drafts.map(d => d.owner).filter(Boolean),
+    ...drafts.map(d => d.assignee).filter(Boolean),
+  ].map(n => String(n).trim()).filter(Boolean))];
+
+  const commitTransfer = (draft, name) => {
+    const clean = String(name || '').trim();
+    if (!clean || !onTransferOwner) return;
+    onTransferOwner(draft, clean);
+    setTransferFor(null);
+    setTransferInput('');
+    setTransferNote({ vendor: draft.vendor, to: clean });
+  };
+
+  // The confirmation line is transient — it should not still be sitting there
+  // when you come back to the dashboard later.
+  useEffect(() => {
+    if (!transferNote) return;
+    const timer = setTimeout(() => setTransferNote(null), 4000);
+    return () => clearTimeout(timer);
+  }, [transferNote]);
 
   const timeAgo = (iso) => {
     if (!iso) return '';
@@ -3317,70 +3450,190 @@ function Dashboard({ t, s, onNavigate, kbEntries = [], drafts = [], onResumeDraf
               {drafts.map(a => {
                 const progress = a.progress || 0;
                 const isComplete = a.step === 'complete';
+                const ownerLabel = (a.owner || '').trim() || myName;
+                const ownerIsMe  = ownerLabel.toLowerCase() === myName.trim().toLowerCase();
+                const initials   = a.ownerInitials || initialsOf(ownerLabel);
+                const open       = transferFor === a.id;
+                const candidates = people.filter(p => p.toLowerCase() !== ownerLabel.toLowerCase());
                 return (
-                  <button
+                  // A div, not a button: the row now holds two independent
+                  // actions (resume, transfer) and a button cannot contain one.
+                  <div
                     key={a.id}
-                    onClick={() => onResumeDraft && onResumeDraft(a)}
                     style={{
-                      display: 'flex', alignItems: 'center', gap: 12,
-                      padding: '11px 14px', background: t.bg,
-                      border: `0.5px solid ${t.border}`, borderRadius: 7,
-                      cursor: 'pointer', textAlign: 'left', width: '100%',
-                      transition: 'border-color .15s',
+                      background: t.bg,
+                      border: `0.5px solid ${open ? t.accent : t.border}`,
+                      borderRadius: 7, transition: 'border-color .15s',
                     }}
                   >
-                    {/* Step badge */}
-                    <div style={{
-                      fontFamily: t.monoFont, fontSize: 9, fontWeight: 600,
-                      color: isComplete ? t.done : t.accent,
-                      background: isComplete ? t.doneBg : t.accentBg,
-                      border: `0.5px solid ${isComplete ? t.done : t.accent}`,
-                      borderRadius: 4, padding: '2px 6px', flexShrink: 0, letterSpacing: '.04em',
-                      textTransform: 'uppercase',
-                    }}>
-                      {stepLabel[a.step] || a.step}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '11px 12px 11px 14px' }}>
+                      <button
+                        onClick={() => onResumeDraft && onResumeDraft(a)}
+                        style={{
+                          flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 12,
+                          background: 'none', border: 'none', padding: 0, margin: 0,
+                          cursor: 'pointer', textAlign: 'left', font: 'inherit',
+                        }}
+                      >
+                        {/* Step badge */}
+                        <div style={{
+                          fontFamily: t.monoFont, fontSize: 9, fontWeight: 600,
+                          color: isComplete ? t.done : t.accent,
+                          background: isComplete ? t.doneBg : t.accentBg,
+                          border: `0.5px solid ${isComplete ? t.done : t.accent}`,
+                          borderRadius: 4, padding: '2px 6px', flexShrink: 0, letterSpacing: '.04em',
+                          textTransform: 'uppercase',
+                        }}>
+                          {stepLabel[a.step] || a.step}
+                        </div>
+
+                        {/* Info */}
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontFamily: t.sansFont, fontSize: 12, fontWeight: 600, color: t.text, marginBottom: 3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {a.vendor}
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                            {/* Owner — who this assessment belongs to */}
+                            <span
+                              title={`Owner: ${ownerLabel}`}
+                              style={{ display: 'flex', alignItems: 'center', gap: 4 }}
+                            >
+                              <span style={{
+                                width: 15, height: 15, borderRadius: '50%', flexShrink: 0,
+                                background: ownerIsMe ? t.accent : t.bg2,
+                                color: ownerIsMe ? '#fff' : t.text2,
+                                border: `0.5px solid ${ownerIsMe ? t.accent : t.border2}`,
+                                fontFamily: t.monoFont, fontSize: 7, fontWeight: 700,
+                                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              }}>
+                                {initials}
+                              </span>
+                              <span style={{ fontFamily: t.sansFont, fontSize: 10, color: ownerIsMe ? t.text2 : t.text3 }}>
+                                {ownerLabel}{ownerIsMe ? ' (you)' : ''}
+                              </span>
+                            </span>
+                            {/* Assignee */}
+                            {a.assignee && (
+                              <span style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3, display: 'flex', alignItems: 'center', gap: 3 }}>
+                                <span style={{ color: t.border2 }}>→</span>
+                                {a.assignee}
+                              </span>
+                            )}
+                            {/* Time */}
+                            <span style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3 }}>
+                              {timeAgo(a.savedAt)}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Progress bar + % */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                          <div style={{ width: 50, height: 3, background: t.border, borderRadius: 2 }}>
+                            <div style={{ height: '100%', width: `${progress}%`, background: isComplete ? t.done : progress > 60 ? t.accent : t.warn, borderRadius: 2, transition: 'width .3s' }} />
+                          </div>
+                          <div style={{ fontFamily: t.sansFont, fontSize: 10, fontWeight: 700, color: isComplete ? t.done : t.accent, width: 28, textAlign: 'right' }}>
+                            {isComplete ? '✓' : `${progress}%`}
+                          </div>
+                        </div>
+
+                        {/* Resume arrow */}
+                        <ChevronRight size={13} color={t.text3} style={{ flexShrink: 0 }} />
+                      </button>
+
+                      {/* Transfer ownership */}
+                      <button
+                        onClick={() => {
+                          setTransferFor(open ? null : a.id);
+                          setTransferInput('');
+                        }}
+                        title={open ? 'Cancel transfer' : `Transfer ownership from ${ownerLabel}`}
+                        aria-expanded={open}
+                        style={{
+                          flexShrink: 0, display: 'flex', alignItems: 'center', gap: 4,
+                          background: open ? t.accentBg : 'transparent',
+                          border: `0.5px solid ${open ? t.accent : t.border}`,
+                          borderRadius: 5, padding: '4px 8px', cursor: 'pointer',
+                          fontFamily: t.sansFont, fontSize: 10, fontWeight: 600,
+                          color: open ? t.accent : t.text3,
+                        }}
+                      >
+                        {open ? <X size={10} /> : <Send size={10} />}
+                        {open ? 'Cancel' : 'Transfer'}
+                      </button>
                     </div>
 
-                    {/* Info */}
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontFamily: t.sansFont, fontSize: 12, fontWeight: 600, color: t.text, marginBottom: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {a.vendor}
-                      </div>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                        {/* Owner */}
-                        <span style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3, display: 'flex', alignItems: 'center', gap: 3 }}>
-                          <User size={9} color={t.text3} />
-                          {a.owner || 'You'}
-                        </span>
-                        {/* Assignee */}
-                        {a.assignee && (
-                          <span style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3, display: 'flex', alignItems: 'center', gap: 3 }}>
-                            <span style={{ color: t.border2 }}>→</span>
-                            {a.assignee}
-                          </span>
+                    {/* ── Transfer panel ── */}
+                    {open && (
+                      <div style={{ borderTop: `0.5px solid ${t.border}`, background: t.bg2, padding: '12px 14px', borderRadius: '0 0 7px 7px' }}>
+                        <div style={{ ...s.label, marginBottom: 6 }}>Transfer ownership</div>
+                        <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3, lineHeight: 1.5, marginBottom: 10 }}>
+                          <strong style={{ color: t.text2, fontWeight: 600 }}>{a.vendor}</strong> is owned by{' '}
+                          <strong style={{ color: t.text2, fontWeight: 600 }}>{ownerLabel}</strong>. Pick a new owner, or type a name.
+                        </div>
+
+                        {candidates.length > 0 && (
+                          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10 }}>
+                            {candidates.map(p => (
+                              <button
+                                key={p}
+                                onClick={() => commitTransfer(a, p)}
+                                style={{
+                                  display: 'flex', alignItems: 'center', gap: 5,
+                                  background: 'transparent', border: `0.5px solid ${t.border}`,
+                                  borderRadius: 5, padding: '4px 9px', cursor: 'pointer',
+                                  fontFamily: t.sansFont, fontSize: 11, fontWeight: 500, color: t.text2,
+                                }}
+                              >
+                                <User size={9} color={t.text3} />{p}
+                              </button>
+                            ))}
+                          </div>
                         )}
-                        {/* Time */}
-                        <span style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3 }}>
-                          {timeAgo(a.savedAt)}
-                        </span>
-                      </div>
-                    </div>
 
-                    {/* Progress bar + % */}
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-                      <div style={{ width: 50, height: 3, background: t.border, borderRadius: 2 }}>
-                        <div style={{ height: '100%', width: `${progress}%`, background: isComplete ? t.done : progress > 60 ? t.accent : t.warn, borderRadius: 2, transition: 'width .3s' }} />
-                      </div>
-                      <div style={{ fontFamily: t.sansFont, fontSize: 10, fontWeight: 700, color: isComplete ? t.done : t.accent, width: 28, textAlign: 'right' }}>
-                        {isComplete ? '✓' : `${progress}%`}
-                      </div>
-                    </div>
+                        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                          <input
+                            value={transferInput}
+                            onChange={e => setTransferInput(e.target.value)}
+                            onKeyDown={e => { if (e.key === 'Enter') commitTransfer(a, transferInput); }}
+                            placeholder="New owner's name…"
+                            style={{ ...s.input, fontSize: 11, padding: '6px 10px', flex: 1 }}
+                          />
+                          <button
+                            onClick={() => commitTransfer(a, transferInput)}
+                            disabled={!transferInput.trim()}
+                            style={{
+                              ...s.accentBtn, fontSize: 11, padding: '6px 14px', flexShrink: 0,
+                              opacity: transferInput.trim() ? 1 : 0.45,
+                              cursor: transferInput.trim() ? 'pointer' : 'not-allowed',
+                            }}
+                          >
+                            Transfer
+                          </button>
+                        </div>
 
-                    {/* Resume arrow */}
-                    <ChevronRight size={13} color={t.text3} style={{ flexShrink: 0 }} />
-                  </button>
+                        {/* Honest about what this can and cannot do yet. */}
+                        <div style={{ display: 'flex', gap: 5, marginTop: 9 }}>
+                          <AlertTriangle size={10} color={t.text3} style={{ flexShrink: 0, marginTop: 2 }} />
+                          <span style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3, lineHeight: 1.5 }}>
+                            Suggestions come from people already named on your assessments. Until sign-in is enforced,
+                            transferring records the new owner on the questionnaire but does not move it into their
+                            account — see the note in AMPLIFY_SETUP.md.
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 );
               })}
+
+              {transferNote && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '8px 12px', background: t.doneBg, border: `0.5px solid ${t.done}`, borderRadius: 6 }}>
+                  <CheckCircle size={12} color={t.done} style={{ flexShrink: 0 }} />
+                  <span style={{ fontFamily: t.sansFont, fontSize: 11, color: t.done }}>
+                    {transferNote.vendor} is now owned by {transferNote.to}.
+                  </span>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -4248,6 +4501,36 @@ export default function Serotonin() {
     recordAudit('questionnaire.delete', 'Questionnaire', id);
   };
 
+  /**
+   * Hand an assessment to someone else.
+   *
+   * Writes the whole record back rather than a patch, because the store's put is
+   * a full-item write — a partial one would blank the questions. `savedAt` is
+   * deliberately left alone: it is what the dashboard shows as "last worked on"
+   * and drives the ordering, and a transfer is not work on the questionnaire.
+   *
+   * Note what this does NOT do: with sign-in not yet enforced, every browser is
+   * its own guest identity, so the record stays under the current owner's
+   * `ownerKey` and the new owner will not see it in their own library. The name
+   * change and the audit entry are real; the hand-off across accounts needs auth.
+   */
+  const transferDraftOwner = (draft, name) => {
+    const clean = String(name || '').trim();
+    if (!draft?.id || !clean) return;
+    const previous = draft.owner || '';
+    if (previous.trim().toLowerCase() === clean.toLowerCase()) return;
+    saveDraftRecord({
+      ...draft,
+      owner: clean,
+      ownerInitials: initialsOf(clean),
+    });
+    recordAudit('questionnaire.transfer', 'Questionnaire', draft.id, {
+      vendor: draft.vendor,
+      from: previous,
+      to: clean,
+    });
+  };
+
   // Attachments outlive the questionnaire unless something clears them. Called
   // when an assessment is completed or discarded, so neither the Attachment
   // table nor the S3 bucket accumulates rows and objects nothing points at.
@@ -4648,7 +4931,7 @@ export default function Serotonin() {
 
         {/* Main content */}
         <main style={{ flex: 1, overflowY: 'auto', padding: '32px 36px 80px', scrollBehavior: 'smooth' }}>
-          {module === 'dashboard' && <Dashboard t={t} s={s} onNavigate={setModule} kbEntries={kbEntries} drafts={drafts} onResumeDraft={(draft) => { setResumeDraftId(draft.id); setModule('editor'); }} profile={profile} />}
+          {module === 'dashboard' && <Dashboard t={t} s={s} onNavigate={setModule} kbEntries={kbEntries} drafts={drafts} onResumeDraft={(draft) => { setResumeDraftId(draft.id); setModule('editor'); }} profile={profile} onTransferOwner={transferDraftOwner} />}
           {module === 'editor'    && <QuestionnaireEditor t={t} s={s} onBack={() => { setResumeDraftId(null); setModule('dashboard'); }} onAddToKb={addKbEntry} drafts={drafts} onSaveDraft={saveDraft} onDeleteDraft={deleteDraft} profile={profile} resumeDraftId={resumeDraftId} onClearResume={() => setResumeDraftId(null)} onReleaseAttachments={releaseAttachments} />}
           {module === 'vendor'    && <VendorDashboard t={t} s={s} />}
           {module === 'batch'     && <BatchProcessing t={t} s={s} />}

@@ -13,7 +13,7 @@
     "sandbox:delete": "ampx sandbox delete",
     "test": "npm run test:unit",
     "test:unit": "node tests/extraction.spec.mjs && node tests/matching.spec.mjs && node tests/xlsx.spec.mjs",
-    "test:browser": "node tests/persistence.spec.mjs && node tests/autoreview.spec.mjs",
+    "test:browser": "node tests/persistence.spec.mjs && node tests/autoreview.spec.mjs && node tests/ownership.spec.mjs",
     "fixtures": "node tests/fixtures/make-xlsx.mjs"
   },
   "dependencies": {

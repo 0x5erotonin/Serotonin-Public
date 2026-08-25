@@ -157,11 +157,30 @@ until Google SSO is wired up.
 
 **The frontend builds but the app runs on device-only storage**
 
-`amplify_outputs.json` was never written, which means the backend phase did not
-finish. Check the build log for the `pipeline-deploy` step and confirm the service
-role has backend deploy permissions (step 2 above). This is deliberate behaviour —
-a failed backend deploy degrades to on-device storage rather than shipping a
-broken app — but it is not what you want in production.
+`amplify_outputs.json` was never written, which means `pipeline-deploy` failed.
+The build log ends with a banner saying so, and the last line of the backend phase
+reports which storage the app will use.
+
+This is deliberate: the backend phase is followed by `|| echo …` in `amplify.yml`,
+so a backend failure is loud but does not abort the build. The reasoning is in the
+comment at the top of that file — briefly, the app has a real degraded mode, so
+deploying degraded beats not deploying at all while the backend is being brought
+up. **Once the backend deploys cleanly, delete the `|| echo …` to make it strict
+again**, or a later regression will silently drop every user to device-only
+storage.
+
+**Reading a truncated build log**
+
+The Amplify console truncates long logs in the browser. If the error is below the
+cut, either use the download-logs link on the build page, or skip the console
+entirely and reproduce it locally in about two minutes:
+
+```bash
+npx ampx sandbox --once
+```
+
+That runs the same validation and deployment against your own isolated stack, and
+prints the full error to your terminal. `npm run sandbox:delete` tears it down.
 
 ---
 
@@ -275,6 +294,124 @@ done.
 `src/lib/files.js` already picks the enforced prefix automatically once a user is
 signed in — no changes needed there.
 
+### Another user sees none of my work — why, and the options
+
+Reported symptom: *"I can see all of the documents I uploaded, but when another
+user logs in from a different IP, they cannot see anything I have worked on."*
+
+**It is not the IP address.** Nothing in the app, in AppSync or in Amplify
+Hosting keys on IP. The same thing happens to you in a private window, in a
+second browser, or on your phone — which is the quickest way to confirm it in
+about ten seconds. What is actually happening is one of the three causes below,
+and they need different fixes, so identify which one first.
+
+#### Step 1 — find out which cause you have
+
+| Check | Where | What it tells you |
+|---|---|---|
+| **Storage & Security panel** | Knowledge base → *Storage info* | If **Primary** reads *"This device only — no backend is attached to this build"*, cause **A**. If it reads *"AWS DynamoDB via AppSync"*, cause **B**. |
+| Build log | Amplify console → the build → backend phase | The build prints either `amplify_outputs.json written — the app will use AWS.` or `NO amplify_outputs.json — the app will use on-device storage only.` |
+| The URL both people opened | Browser address bar | A different branch or a PR preview is a different backend entirely — cause **C**. |
+
+**Cause A — no backend is attached.** Records live in this browser's
+`localStorage`, files in its IndexedDB. Nothing has ever left the machine, so no
+other person or device can see any of it, by construction. This is the state the
+frontend-only `amplify.yml` produces, and the state a failed backend deploy
+produces. Nothing below about sharing matters until this is fixed.
+
+**Cause B — the backend is live, and every browser is its own guest identity.**
+Auth is provisioned but not enforced, so each browser is issued its own Cognito
+*unauthenticated* identity. Records are written with that identity as `ownerKey`
+and read back filtered on it; files go to `guest-files/<identityId>/`. Two people
+are two identities, so they see two empty libraries. This is working as designed
+— the design just does not include sharing yet.
+
+**Cause C — different backends.** `amplify_outputs.json` is generated per branch.
+`main` and a preview branch have separate DynamoDB tables and S3 buckets. Two
+people on two branch URLs will never see each other's data no matter what auth
+says.
+
+#### Step 2 — pick a fix
+
+Ordered by how much they change. 1 is a prerequisite for everything after it.
+
+**1. Get the backend deploying (fixes cause A).** Not optional — every option
+below needs a live AppSync API. `amplify.yml` currently keeps the build green
+when the backend fails; the "Troubleshooting the build" section above is how to
+get the real error out of a truncated console log.
+
+**2. Turn on Cognito sign-in with owner-based auth.** The five steps under
+*Turning auth on later*. This is the right next step regardless of which sharing
+model you choose, because it replaces a `localStorage`-resident guest identity
+with a durable user ID and makes AppSync enforce scoping instead of trusting the
+client. Be clear about what it does *not* do: it gives every user their own
+private library. On its own it does not make your work visible to a colleague —
+it makes the current behaviour correct and intentional rather than incidental.
+
+**3. Shared team library — one workspace everyone sees.** This is the option that
+actually matches the report. Three ways to build it, in increasing order of rigour:
+
+- **3a. Tenant field + `allow.authenticated()`.** Add `tenantId` to every model,
+  set it from a single org value, filter on it instead of `ownerKey`. Any
+  signed-in user reads the whole tenant. Cheapest to build — an afternoon — but
+  enforcement is coarse: *any* member of the user pool can read everything, so
+  it is only safe if pool membership is exactly your team. Pair it with a
+  pre-sign-up Lambda trigger that rejects addresses outside `@creyos.com`, or
+  admin-only user creation (invite-only). Without that gate, self-sign-up means
+  anyone on the internet can join the tenant.
+- **3b. Cognito groups.** Put people in a group and use
+  `allow.group('creyos')`, or `allow.groupsDefinedIn('teamId')` for a per-record
+  group. AppSync enforces group membership inside the resolver, so it holds up
+  even if the client is bypassed, and it scales to more than one team. This is
+  the option to choose if real customer questionnaires are going in.
+- **3c. Per-owner private, shared by name.** Keep records owner-scoped and use
+  `allow.ownersDefinedIn('editors')` so a record carries a list of users who may
+  read and edit it. Most granular and the best fit for "hand this questionnaire
+  to Sarah, not the whole team", but it needs real UI: a person picker, an
+  invite flow, and a way to see what has been shared with you.
+
+**4. Move the files, not just the records.** Records and S3 objects are separate
+problems. Sharing rows without re-keying objects gets you a library where every
+document is listed and none of them open. Two parts:
+
+- Change `amplify/storage/resource.ts` — drop `guest-files/*` and add a prefix
+  the team can read, e.g. `team-files/*` with `allow.authenticated(['read',
+  'write'])`, or a group rule matching 3b.
+- Migrate what is already stored. Existing `KbDocument.storagePath` and
+  `Attachment.storagePath` values point at `guest-files/<oldIdentityId>/…`. Copy
+  the objects to the new prefix and update the rows, or those documents fall back
+  to the *"Metadata only — the file itself was not stored"* state.
+
+**5. Make ownership transfer real.** The Dashboard can already hand an assessment
+to another person by name, and records it in the audit log — but with no
+identities it cannot move the record, so the new owner does not get it in their
+library. Once 2 and 3 are in, extend `transferDraftOwner` in `src/Serotonin.jsx`
+to set the record's owner key (or its `editors` list) alongside the display name,
+and the transfer becomes an actual hand-off.
+
+**6. Stopgaps, if this needs to work before the auth pass.** Both are honest
+about their cost:
+
+- **A shared owner key.** In `src/lib/amplifyClient.js`, make `getOwnerKey()`
+  return a fixed string — `'creyos-shared'` — and use one shared S3 prefix
+  instead of per-identity. Every browser then reads and writes the same library
+  immediately; it is a handful of lines. What it costs: the data becomes readable
+  and writable by anyone who finds the API endpoint in the JS bundle. Note that
+  guest access is *already* unenforced, so this does not lower the enforcement
+  bar — it stops relying on per-browser obscurity, which is not a security
+  control. Fine for demo data. Not fine for real questionnaires or real SOC 2
+  reports.
+- **Export and import.** Add a JSON export of the library and an import on the
+  other side. No infrastructure, no exposure, and it works today — but it is a
+  manual copy, and two people will diverge the moment they both edit.
+
+#### Recommended path
+
+2 → 3b → 4 → 5, with 6's shared owner key only if something has to be
+demonstrable to two people this week. Skipping straight to 3a without a domain
+gate on sign-up is the one combination worth avoiding: it reads as "we have auth
+now" while leaving the library open to any account that can sign itself up.
+
 ### Supabase leftovers
 
 `src/lib/supabase.js`, `src/lib/useAuth.js`, `docs/supabase_schema.sql` and the
@@ -295,8 +432,14 @@ npm install
 npm i -D playwright && npx playwright install chromium
 npm run build
 npm run preview &                  # serves dist/ on :4173
-node tests/persistence.spec.mjs
+npm run test:browser               # persistence + auto-review + ownership
 ```
+
+`tests/ownership.spec.mjs` covers the library listing and ownership: that a
+policy document is reachable from *All entries* and not only from the Policy
+documents tab, and that transferring an assessment survives a refresh **and** the
+previous owner reopening it — the editor used to stamp its own profile name onto
+every autosave, which quietly undid the transfer.
 
 Playwright is intentionally not a dependency: some versions download ~150MB of
 browsers on install, which would run on every Amplify build and is never used

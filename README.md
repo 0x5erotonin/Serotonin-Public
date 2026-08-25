@@ -27,9 +27,9 @@ Then it happens again next month. And the month after that.
 
 **📊 It handles the spreadsheets** — A SIG or CAIQ workbook is a cover page, an instructions tab, a glossary, the questionnaire, and usually an old version nobody deleted. Serotonin works out which sheet is the questionnaire and which column holds the questions — they're rarely in column A — skips the rest, and tells you exactly what it picked: *"used column C ("Question") of "Full Questionnaire" — skipped "Instructions" (looks like guidance), "Glossary" (looks like a glossary)"*.
 
-**🧠 Knowledge base** — Every questionnaire you complete gets indexed and searchable, and so does every policy document you import: SOC 2 reports, access control policies, disaster recovery plans are split into passages, embedded, and cited by page. Genuinely gets better with every questionnaire you run through it, because your own answers become the best match for next time.
+**🧠 Knowledge base** — Every questionnaire you complete gets indexed and searchable, and so does every policy document you import: SOC 2 reports, access control policies, disaster recovery plans are split into passages, embedded, and cited by page. One library, one search — completed questionnaires and imported documents sit side by side under *All entries*. Genuinely gets better with every questionnaire you run through it, because your own answers become the best match for next time.
 
-**🗂 Dashboard** — See everything in flight at a glance. Who owns what, where it's at in the workflow, how complete it is, who it's assigned to. One click to pick up where you left off.
+**🗂 Dashboard** — See everything in flight at a glance. Who owns what, where it's at in the workflow, how complete it is, who it's assigned to. Hand an assessment to a colleague with the Transfer button. One click to pick up where you left off.
 
 **📖 Internal wiki** — Full documentation built directly into the app. 16 articles covering every feature, security posture, tips, and troubleshooting. No external Notion or Confluence required.
 
@@ -69,6 +69,12 @@ No UI framework. No component library. Just React, inline styles, and a semantic
 > so record scoping is client-side rather than IAM-enforced. Fine for a demo and
 > for your own data; not yet for real customer questionnaires. The exact exposure
 > and the five-step fix are in [AMPLIFY_SETUP.md](AMPLIFY_SETUP.md#️-security-posture-while-auth-is-deferred).
+>
+> The same trade-off is why **two people do not see each other's work**: each
+> browser is issued its own Cognito guest identity, so each gets its own private
+> library. It is not a network or IP problem. The diagnostic and the options for
+> changing it are in [Another user sees none of my
+> work](AMPLIFY_SETUP.md#another-user-sees-none-of-my-work--why-and-the-options).
 
 ---
 
@@ -152,9 +158,10 @@ npm run test:browser
 
 `test:unit` runs the extraction, matching and spreadsheet logic in plain Node —
 six real questionnaire formats, a SIG-shaped workbook, hybrid scoring, and
-performance bounds. `npm test` adds two
-browser suites: one asserting that everything survives a refresh, one driving a
-real PDF through the whole auto-review chain with the real PDF.js.
+performance bounds. `test:browser` adds three suites: one asserting that
+everything survives a refresh, one driving a real PDF through the whole
+auto-review chain with the real PDF.js, and one covering the library listing and
+ownership transfer.
 
 More on how parsing and scoring work, and where the thresholds live, in
 **[AUTO_REVIEW.md](AUTO_REVIEW.md)**.
@@ -192,7 +199,7 @@ Serotonin-public/
 │       ├── kbIndex.js          ← indexing, coverage, backfill
 │       ├── supabase.js         ← dormant (see AMPLIFY_SETUP.md)
 │       └── useAuth.js          ← dormant
-├── tests/                      ← extraction · matching · persistence · auto-review
+├── tests/                      ← extraction · matching · xlsx · persistence · auto-review · ownership
 ├── amplify.yml                 ← Amplify build spec (backend + frontend)
 ├── customHttp.yml              ← security headers
 ├── AMPLIFY_SETUP.md            ← deployment + the auth to-do list
