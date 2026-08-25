@@ -331,7 +331,94 @@ try {
     (await page.locator('button:has-text("All entries")').first().innerText()).includes('(2)'),
   );
 
-  /* ── 12. No noise ──────────────────────────────────────────────────────── */
+  /* ── 12. Renaming a policy document ────────────────────────────────────── */
+  await page.click('button:has-text("Policy documents (1)")');
+  await sleep(600);
+
+  const readDocs = () =>
+    page.evaluate(() => JSON.parse(localStorage.getItem('serotonin.v2.kbDocs') || '[]'));
+
+  await page.click('button[title="Rename document"]');
+  await sleep(400);
+  check(
+    'the rename control opens an editable field',
+    await page.locator('input[aria-label="Document name"]').isVisible(),
+  );
+  check(
+    'the field is prefilled with the current name',
+    (await page.locator('input[aria-label="Document name"]').inputValue()) === 'soc2-type-ii-2026.pdf',
+  );
+
+  // Cancel leaves it alone.
+  await page.fill('input[aria-label="Document name"]', 'Should Not Be Saved');
+  await page.click('button:has-text("Cancel")');
+  await sleep(800);
+  check(
+    'cancelling a rename changes nothing',
+    (await readDocs())[0]?.name === 'soc2-type-ii-2026.pdf',
+    `name=${(await readDocs())[0]?.name}`,
+  );
+
+  // An empty name is refused rather than saved.
+  await page.click('button[title="Rename document"]');
+  await page.fill('input[aria-label="Document name"]', '   ');
+  await page.click('button:has-text("Save")');
+  await sleep(600);
+  check(
+    'an empty name is refused',
+    (await page.locator('body').innerText()).includes('Give the document a name.'),
+  );
+  check(
+    'the field stays open so the name is not lost',
+    await page.locator('input[aria-label="Document name"]').isVisible(),
+  );
+
+  // A path traversal attempt is sanitised end to end, not just in the unit test.
+  await page.fill('input[aria-label="Document name"]', '../../etc/passwd');
+  await page.click('button:has-text("Save")');
+  await sleep(1200);
+  const traversed = (await readDocs())[0]?.name || '';
+  check(
+    'a rename cannot introduce path separators into the download filename',
+    !traversed.includes('/') && !traversed.includes('\\') && traversed.length > 0,
+    `stored as "${traversed}"`,
+  );
+
+  // The real rename, by keyboard.
+  await page.click('button[title="Rename document"]');
+  await page.fill('input[aria-label="Document name"]', 'SOC 2 Type II — FY26');
+  await page.keyboard.press('Enter');
+  await sleep(1200);
+
+  const renamed = (await readDocs())[0];
+  check(
+    'Enter commits the rename',
+    renamed?.name === 'SOC 2 Type II — FY26.pdf',
+    `name=${renamed?.name}`,
+  );
+  check(
+    'the dropped extension is restored, so the file still opens when downloaded',
+    String(renamed?.name || '').endsWith('.pdf'),
+  );
+  check(
+    'renaming does not move the stored file',
+    !!renamed?.storagePath && renamed.storagePath.includes('soc2-type-ii-2026.pdf'),
+    `storagePath=${renamed?.storagePath}`,
+  );
+
+  await page.reload({ waitUntil: 'networkidle' });
+  await sleep(2500);
+  const afterRenameReload = await page.locator('body').innerText();
+  check(
+    'the new name survives a refresh',
+    afterRenameReload.includes('SOC 2 Type II — FY26.pdf') && !afterRenameReload.includes('soc2-type-ii-2026.pdf'),
+  );
+  check(
+    'the renamed document is still openable',
+    await page.locator('button[title="Open document"]').first().isVisible(),
+  );
+
+  /* ── 13. No noise ──────────────────────────────────────────────────────── */
   check(
     'no console errors',
     consoleErrors.length === 0,

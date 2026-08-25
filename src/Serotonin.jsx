@@ -14,12 +14,13 @@ import { migrateLegacySessionState, recordAudit, deleteWhere } from './lib/store
 import { uploadFile, removeFile, openFile, getFileUrl, formatBytes } from './lib/files.js';
 import { isAmplifyConfigured, whenReady } from './lib/amplifyClient.js';
 import { extractText, SUPPORTED_LABEL } from './lib/extract.js';
+import { normaliseDocName } from './lib/docName.js';
 import { extractQuestions, questionsFromLines } from './lib/questionExtract.js';
 import { questionsFromSheets, describeReport } from './lib/gridQuestions.js';
 import { autoReview } from './lib/matcher.js';
 import {
   loadChunks, indexDocument, indexQaPairs, removeChunksFor,
-  indexCoverage, backfillIndex,
+  indexCoverage, backfillIndex, withCurrentSourceNames,
 } from './lib/kbIndex.js';
 
 // Serotonin v2.0
@@ -664,7 +665,7 @@ function ApprovalStep({ t, s, vendor, questions, onBack, onComplete, questionnai
 
 // ─── QUESTIONNAIRE EDITOR ─────────────────────────────────────────────────────
 
-function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft, onDeleteDraft, profile, resumeDraftId, onClearResume, onReleaseAttachments }) {
+function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = [], onSaveDraft, onDeleteDraft, profile, resumeDraftId, onClearResume, onReleaseAttachments }) {
 
   // ── Load draft if resuming ─────────────────────────────────────
   const resumeDraft = resumeDraftId ? drafts.find(d => d.id === resumeDraftId) : null;
@@ -926,7 +927,9 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], onSaveDraft
     setReviewSummary(null);
 
     try {
-      const chunks = await loadChunks();
+      // Names are refreshed from the document records so a citation quotes what
+      // the document is called now, not what it was called when it was indexed.
+      const chunks = withCurrentSourceNames(await loadChunks(), kbDocs);
       const { questions: reviewed, summary } = await autoReview(seeded, {
         chunks,
         onProgress: (stage, detail) => { if (isCurrent()) setReviewProgress({ stage, detail }); },
@@ -1860,7 +1863,7 @@ function BatchProcessing({ t, s }) {
 
 // ─── KNOWLEDGE BASE ───────────────────────────────────────────────────────────
 
-function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDoc, onDeleteEntry }) {
+function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDoc, onRenameDoc, onDeleteEntry }) {
   const [view,          setView]          = useState('library');
   const [viewMode,      setViewMode]      = useState('grid');
   const [search,        setSearch]        = useState('');
@@ -1919,6 +1922,38 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
     }
   };
   const [deleteConfirm, setDeleteConfirm] = useState(null); // entry to confirm-delete
+
+  // ── Renaming a policy document ─────────────────────────────────
+  // Inline on the card rather than in a modal: it is a single field, and a
+  // dialog for one text input is more ceremony than the action deserves.
+  const [renamingId,  setRenamingId]  = useState(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [renameError, setRenameError] = useState('');
+
+  const startRename = (doc) => {
+    setRenamingId(doc.id);
+    setRenameValue(doc.name || '');
+    setRenameError('');
+  };
+
+  const cancelRename = () => {
+    setRenamingId(null);
+    setRenameValue('');
+    setRenameError('');
+  };
+
+  const commitRename = (doc) => {
+    // normaliseDocName is where the input is actually made safe — this name
+    // becomes the download filename, so it cannot be allowed to carry path
+    // separators or control characters. See src/lib/docName.js.
+    const next = normaliseDocName(renameValue, doc.name);
+    if (!next) {
+      setRenameError('Give the document a name.');
+      return;
+    }
+    if (next !== doc.name && onRenameDoc) onRenameDoc(doc.id, next);
+    cancelRename();
+  };
 
   // Tags come from both kinds of library item, so a tag on a policy document is
   // selectable in the same filter row as one on a questionnaire.
@@ -2201,7 +2236,40 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
                       </div>
                       {/* Info */}
                       <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontFamily: t.sansFont, fontSize: 13, fontWeight: 600, color: t.text, marginBottom: 3 }}>{doc.name}</div>
+                        {renamingId === doc.id ? (
+                          <div style={{ marginBottom: 6 }}>
+                            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                              <input
+                                autoFocus
+                                value={renameValue}
+                                onChange={e => { setRenameValue(e.target.value); if (renameError) setRenameError(''); }}
+                                onKeyDown={e => {
+                                  if (e.key === 'Enter') commitRename(doc);
+                                  if (e.key === 'Escape') cancelRename();
+                                }}
+                                aria-label="Document name"
+                                style={{ ...s.input, fontSize: 13, fontWeight: 600, padding: '6px 10px', flex: 1 }}
+                              />
+                              <button
+                                onClick={() => commitRename(doc)}
+                                style={{ ...s.accentBtn, fontSize: 11, padding: '6px 12px', flexShrink: 0 }}
+                              >
+                                Save
+                              </button>
+                              <button
+                                onClick={cancelRename}
+                                style={{ ...s.ghostBtn, fontSize: 11, padding: '6px 12px', flexShrink: 0 }}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                            {renameError && (
+                              <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.warnText, marginTop: 5 }}>{renameError}</div>
+                            )}
+                          </div>
+                        ) : (
+                          <div style={{ fontFamily: t.sansFont, fontSize: 13, fontWeight: 600, color: t.text, marginBottom: 3, overflowWrap: 'anywhere' }}>{doc.name}</div>
+                        )}
                         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
                           <span style={s.pill(t.accentBg, t.accentText)}>{doc.category}</span>
                           <span style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3 }}>{doc.size}</span>
@@ -2222,8 +2290,22 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
                           </div>
                         )}
                       </div>
-                      {/* Open / remove */}
+                      {/* Rename / open / remove */}
                       <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
+                        <button
+                          onClick={() => (renamingId === doc.id ? cancelRename() : startRename(doc))}
+                          style={{
+                            background: renamingId === doc.id ? t.accentBg : 'transparent',
+                            border: `0.5px solid ${renamingId === doc.id ? t.accent : t.border}`,
+                            borderRadius: 5, padding: '3px 8px', marginRight: 4, cursor: 'pointer',
+                            fontFamily: t.sansFont, fontSize: 10, fontWeight: 600,
+                            color: renamingId === doc.id ? t.accent : t.text3,
+                          }}
+                          title="Rename document"
+                          aria-label={`Rename ${doc.name}`}
+                        >
+                          Rename
+                        </button>
                         {doc.storagePath ? (
                           <button
                             onClick={() => openFile(doc.storagePath, { filename: doc.name })}
@@ -2805,6 +2887,13 @@ Click tag chips below the search bar to filter by category (SOC 2, HIPAA, Comple
 
 **Viewing Q&A**
 Each card has a "View questions & answers" toggle that expands to show every question and its answer inline.
+
+**Renaming a document**
+Click Rename on any policy document card, type the new name, and press Enter (or click Save). Escape or Cancel backs out.
+
+A document's name is also the filename you get when you download it, so a few things are cleaned up for you: path separators and control characters are stripped, leading dots are removed so a rename cannot produce a hidden file, and if you drop the extension the original one is put back — "Answered SIG" on an .xlsx becomes "Answered SIG.xlsx", because a file with no extension is one the operating system cannot open.
+
+Renaming changes the label only. The stored file keeps its original storage key, so nothing is re-uploaded and no link breaks, and the document does not need re-indexing — auto-review citations pick up the new name on the next review automatically.
 
 **Deleting an entry**
 Click the × button on any card. A confirmation modal will ask you to confirm before permanently deleting — this cannot be undone.
@@ -4595,6 +4684,29 @@ export default function Serotonin() {
     });
   };
 
+  /**
+   * Rename a policy document.
+   *
+   * Only the record changes. The S3 object keeps its original key — renaming a
+   * label should not move bytes, and that key is what the record and any index
+   * rows point at. The download filename follows the new name regardless,
+   * because `openFile` is handed `doc.name` rather than the key.
+   *
+   * The search index is left alone too. Index rows carry a denormalised
+   * `sourceName` used in citations; rather than rewriting up to 300 rows per
+   * rename — each one a full-collection mirror write — the name is re-resolved
+   * from the document record when the index is loaded for a review. See
+   * `withCurrentSourceNames` in src/lib/kbIndex.js.
+   */
+  const renameKbDoc = (id, name) => {
+    const doc = kbDocs.find(d => String(d.id) === String(id));
+    if (!doc) return;
+    const next = normaliseDocName(name, doc.name);
+    if (!next || next === doc.name) return;
+    saveKbDocRecord({ ...doc, name: next });
+    recordAudit('document.rename', 'KbDocument', id, { from: doc.name, to: next });
+  };
+
   // Deleting the record has to take the stored file and its index entries with
   // it, otherwise the S3 bucket accumulates orphaned objects and auto-review
   // keeps citing a document that is no longer in the library.
@@ -4932,10 +5044,10 @@ export default function Serotonin() {
         {/* Main content */}
         <main style={{ flex: 1, overflowY: 'auto', padding: '32px 36px 80px', scrollBehavior: 'smooth' }}>
           {module === 'dashboard' && <Dashboard t={t} s={s} onNavigate={setModule} kbEntries={kbEntries} drafts={drafts} onResumeDraft={(draft) => { setResumeDraftId(draft.id); setModule('editor'); }} profile={profile} onTransferOwner={transferDraftOwner} />}
-          {module === 'editor'    && <QuestionnaireEditor t={t} s={s} onBack={() => { setResumeDraftId(null); setModule('dashboard'); }} onAddToKb={addKbEntry} drafts={drafts} onSaveDraft={saveDraft} onDeleteDraft={deleteDraft} profile={profile} resumeDraftId={resumeDraftId} onClearResume={() => setResumeDraftId(null)} onReleaseAttachments={releaseAttachments} />}
+          {module === 'editor'    && <QuestionnaireEditor t={t} s={s} onBack={() => { setResumeDraftId(null); setModule('dashboard'); }} onAddToKb={addKbEntry} drafts={drafts} kbDocs={kbDocs} onSaveDraft={saveDraft} onDeleteDraft={deleteDraft} profile={profile} resumeDraftId={resumeDraftId} onClearResume={() => setResumeDraftId(null)} onReleaseAttachments={releaseAttachments} />}
           {module === 'vendor'    && <VendorDashboard t={t} s={s} />}
           {module === 'batch'     && <BatchProcessing t={t} s={s} />}
-          {module === 'knowledge' && <KnowledgeBase t={t} s={s} kbEntries={kbEntries} kbDocs={kbDocs} onAddDoc={addKbDoc} onRemoveDoc={removeKbDoc} onDeleteEntry={deleteKbEntry} />}
+          {module === 'knowledge' && <KnowledgeBase t={t} s={s} kbEntries={kbEntries} kbDocs={kbDocs} onAddDoc={addKbDoc} onRemoveDoc={removeKbDoc} onRenameDoc={renameKbDoc} onDeleteEntry={deleteKbEntry} />}
           {module === 'wiki'      && <InternalWiki t={t} s={s} onNavigate={setModule} />}
         </main>
       </div>

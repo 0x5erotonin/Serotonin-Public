@@ -26,6 +26,7 @@ import { fetchStoredFile } from './files.js';
 import { chunkPages } from './chunk.js';
 
 export { chunkPages } from './chunk.js';
+export { withCurrentSourceNames } from './sourceNames.js';
 
 /* ── Embedding attachment ─────────────────────────────────────────────────── */
 
