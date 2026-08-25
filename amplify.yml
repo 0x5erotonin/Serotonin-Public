@@ -8,11 +8,27 @@ version: 1
 # the ordering matters: the frontend cannot know its endpoints until
 # pipeline-deploy has run.
 #
-# ─── WHY THE BACKEND PHASE DOES NOT FAIL THE BUILD ───────────────────────────
-# `pipeline-deploy` is followed by `|| echo …`, so a backend failure is logged
-# loudly but does not abort the build.
+# ─── WHY THIS SPEC IS SO QUIET ───────────────────────────────────────────────
+# The Amplify console truncates a long build log, and what you lose is the end —
+# which is where the error is. `npm install` on this dependency tree emits
+# hundreds of lines of deprecation and peer-dependency warnings, and that alone
+# is enough to use up the console's budget. Every build log so far has ended
+# mid-npm-warning for exactly that reason: not a crash there, just the point
+# where the console stopped showing.
 #
-# That is deliberate, and it follows from how the app is written: with no
+# So both install steps now write their output to a file and print nothing unless
+# they fail, in which case the last 60 lines are printed — npm puts the actual
+# reason at the end. `npx ampx` output is teed to backend-deploy.log and, on
+# failure, the tail is reprinted between markers you can search for:
+#
+#     >>>>> BACKEND DEPLOY FAILED
+#
+# If the console still cuts it short, read the log out of band instead — see
+# "Getting the full build log" in AMPLIFY_SETUP.md.
+#
+# ─── WHY THE BACKEND PHASE DOES NOT FAIL THE BUILD ───────────────────────────
+# A backend failure is logged loudly but does not abort the build. That is
+# deliberate, and it follows from how the app is written: with no
 # amplify_outputs.json it runs on durable on-device storage and keyword-only
 # matching. Every feature works; nothing syncs across devices. So a broken
 # backend deploy has two possible outcomes —
@@ -27,43 +43,108 @@ version: 1
 # does fail the build, because a frontend that does not compile has no degraded
 # mode to fall back to.
 #
-# WHEN THE BACKEND IS WORKING, make it strict again by deleting the `|| echo …`
-# from the pipeline-deploy line. Otherwise a regression in the backend will
-# deploy silently and every user will quietly drop to device-only storage.
-# Check the build log for the banner below, and check the app's Storage &
-# Security panel, which reports which backend is actually live.
+# WHEN THE BACKEND IS WORKING, make it strict again: in the pipeline-deploy block
+# below, replace the `else` branch with `exit 1`. Otherwise a regression in the
+# backend will deploy silently and every user will quietly drop to device-only
+# storage.
 #
 # ─── ON `npm ci` vs `npm install` ────────────────────────────────────────────
 # `npm ci` is the right command for CI — it installs exactly what the lockfile
 # says — but it *requires* package-lock.json and fails outright without one. This
 # repo has no lockfile committed yet, so both phases fall back to `npm install`.
 #
-# Commit a lockfile when you can (`npm install && git add package-lock.json`):
-# builds then become reproducible, and this spec will use `npm ci` automatically.
+# Commit a lockfile (`npm install && git add package-lock.json`) and this spec
+# uses `npm ci` automatically. Worth doing: the ERESOLVE peer-dependency warning
+# on zod in the current logs is dependency drift, and a lockfile is what stops
+# the tree changing under you between builds.
 #
 # `--include=dev` is explicit because the backend needs devDependencies —
 # @aws-amplify/backend, the CDK libs and the Bedrock SDK the Lambda bundles — and
 # a build environment that sets NODE_ENV=production would otherwise skip them and
 # fail on `npx ampx`.
+#
+# ─── PUBLISH_BUILD_LOG ───────────────────────────────────────────────────────
+# Set PUBLISH_BUILD_LOG=1 in the Amplify console (App settings → Environment
+# variables) and the backend deploy log is copied into the deployed site as
+# /backend-deploy.log, readable at https://<your-domain>/backend-deploy.log.
+# That sidesteps console truncation entirely.
+#
+# ⚠️  That file is PUBLIC — anyone who guesses the path can read it, and CDK
+# output contains your AWS account ID, role ARNs, and stack and bucket names.
+# Turn it on, read the error, then remove the variable and redeploy. Do not leave
+# it set. Prefer the AWS CLI route in AMPLIFY_SETUP.md if you have credentials to
+# hand; it exposes nothing.
 # ─────────────────────────────────────────────────────────────────────────────
 
 backend:
   phases:
     build:
       commands:
-        - if [ -f package-lock.json ]; then npm ci --include=dev --cache .npm --prefer-offline; else npm install --include=dev --cache .npm --prefer-offline; fi
-        - npm ls @aws-amplify/backend @aws-amplify/backend-cli aws-cdk-lib --depth=0 || true
-        - npx ampx pipeline-deploy --branch $AWS_BRANCH --app-id $AWS_APP_ID || echo "=== BACKEND DEPLOY FAILED — see the error above. The frontend will still build and run on on-device storage. Fix the backend, then remove the '|| echo' from amplify.yml to make this strict again. ==="
-        - if [ -f amplify_outputs.json ]; then echo "amplify_outputs.json written — the app will use AWS."; else echo "NO amplify_outputs.json — the app will use on-device storage only."; fi
+        # Install quietly. On failure, print only the tail — that is where npm
+        # puts the actual reason.
+        - |
+          echo "--- installing dependencies (output suppressed unless it fails) ---"
+          if [ -f package-lock.json ]; then
+            INSTALL="npm ci --include=dev --cache .npm --prefer-offline --no-audit --no-fund"
+          else
+            INSTALL="npm install --include=dev --cache .npm --prefer-offline --no-audit --no-fund"
+          fi
+          if ! $INSTALL > npm-install-backend.log 2>&1; then
+            echo ">>>>> DEPENDENCY INSTALL FAILED — last 60 lines:"
+            tail -60 npm-install-backend.log
+            exit 1
+          fi
+          echo "--- dependencies installed ---"
+        - npx ampx --version || echo ">>>>> ampx is not on PATH — @aws-amplify/backend-cli did not install"
+        - |
+          # pipefail so `| tee` does not mask a non-zero exit from ampx. Guarded,
+          # because a plain POSIX sh would abort the whole phase on the set.
+          set -o pipefail 2>/dev/null || true
+          if npx ampx pipeline-deploy --branch "$AWS_BRANCH" --app-id "$AWS_APP_ID" 2>&1 | tee backend-deploy.log; then
+            echo "--- backend deploy succeeded ---"
+          else
+            echo ""
+            echo ">>>>> BACKEND DEPLOY FAILED — last 80 lines of the deploy output:"
+            echo ">>>>> ------------------------------------------------------------"
+            tail -80 backend-deploy.log
+            echo ">>>>> ------------------------------------------------------------"
+            echo ">>>>> The frontend will still build and run on on-device storage."
+            echo ">>>>> Fix the backend, then make this phase strict again — see the"
+            echo ">>>>> comment at the top of amplify.yml."
+          fi
+        - |
+          if [ -f amplify_outputs.json ]; then
+            echo "amplify_outputs.json written — the app will use AWS."
+          else
+            echo "NO amplify_outputs.json — the app will use on-device storage only."
+          fi
 
 frontend:
   phases:
     preBuild:
       commands:
-        - if [ -f package-lock.json ]; then npm ci --include=dev --cache .npm --prefer-offline; else npm install --include=dev --cache .npm --prefer-offline; fi
+        - |
+          echo "--- installing dependencies (output suppressed unless it fails) ---"
+          if [ -f package-lock.json ]; then
+            INSTALL="npm ci --include=dev --cache .npm --prefer-offline --no-audit --no-fund"
+          else
+            INSTALL="npm install --include=dev --cache .npm --prefer-offline --no-audit --no-fund"
+          fi
+          if ! $INSTALL > npm-install-frontend.log 2>&1; then
+            echo ">>>>> DEPENDENCY INSTALL FAILED — last 60 lines:"
+            tail -60 npm-install-frontend.log
+            exit 1
+          fi
+          echo "--- dependencies installed ---"
     build:
       commands:
         - npm run build
+        # Optional, opt-in, and PUBLIC — read the warning above before enabling.
+        - |
+          if [ "$PUBLISH_BUILD_LOG" = "1" ] && [ -f backend-deploy.log ]; then
+            cp backend-deploy.log dist/backend-deploy.log
+            echo "PUBLISHED /backend-deploy.log to the live site. It is public — remove PUBLISH_BUILD_LOG when you are done."
+          fi
   artifacts:
     baseDirectory: dist
     files:
