@@ -1,5 +1,5 @@
 /**
- * Keeping index citations pointed at the right name.
+ * Keeping index rows pointed at what their source is called and when it landed.
  *
  * Split out of kbIndex.js purely so it can be unit tested: kbIndex pulls in the
  * store, which pulls in the Amplify client, which uses `import.meta.glob` and so
@@ -8,45 +8,68 @@
  */
 
 /**
- * Re-point index rows at their source's current name.
+ * Re-point index rows at their source's current name and date.
  *
  * Index rows store `sourceName` denormalised, because the matcher works over
  * thousands of passages and should not be joining against anything. That copy
  * goes stale the moment a document is renamed, and auto-review would keep citing
- * the old filename — which is precisely when a citation stops being useful,
- * since the reader cannot find the document it names.
+ * the old filename — precisely when a citation stops being useful, since the
+ * reader cannot find the document it names.
+ *
+ * The date is stamped here rather than stored at index time for the same reason
+ * it is needed at all: when two documents both answer a question, the reviewer's
+ * first question is "which of these is current?", and a name alone cannot
+ * answer it.
  *
  * Refreshing on read rather than rewriting on rename is deliberate: a rename
  * then touches one record instead of up to 300 index rows, it cannot half-fail,
  * and it also repairs rows that drifted for any other reason.
  *
- * Only 'document' rows are re-pointed. A 'qa' row's name is built from a
- * completed questionnaire's vendor and date, which renaming a document does not
- * affect.
+ * A 'qa' row's name is composed from a completed questionnaire's vendor and date
+ * at index time and is left alone; only its date is stamped.
  *
- * @param chunks  index rows as loaded
- * @param docs    the current kbDocs list
- * @returns the same rows with document names brought up to date. The original
- *          array is returned untouched when nothing needs correcting, so this is
- *          cheap to call before every review.
+ * @param chunks            index rows as loaded
+ * @param sources.docs      the current kbDocs list
+ * @param sources.entries   the current kbEntries list
+ * @returns the same rows brought up to date. The original array is returned
+ *          untouched when nothing needs correcting, so this is cheap to call
+ *          before every review.
  */
-export function withCurrentSourceNames(chunks = [], docs = []) {
-  if (!chunks.length || !docs.length) return chunks;
+export function withCurrentSources(chunks = [], { docs = [], entries = [] } = {}) {
+  if (!chunks.length) return chunks;
 
-  const nameById = new Map(
-    docs.filter((doc) => doc?.id && doc?.name).map((doc) => [String(doc.id), doc.name]),
+  const docById = new Map(
+    (docs || []).filter((doc) => doc?.id).map((doc) => [String(doc.id), doc]),
   );
-  if (nameById.size === 0) return chunks;
+  const entryById = new Map(
+    (entries || []).filter((entry) => entry?.id).map((entry) => [String(entry.id), entry]),
+  );
+  if (docById.size === 0 && entryById.size === 0) return chunks;
 
   let changed = false;
   const updated = chunks.map((chunk) => {
-    if (chunk?.sourceType !== 'document') return chunk;
-    const current = nameById.get(String(chunk.sourceId));
-    // No match means the document was deleted; keep the stored name so the row
-    // still says something rather than going blank.
-    if (!current || current === chunk.sourceName) return chunk;
+    const isDoc = chunk?.sourceType === 'document';
+    const source = (isDoc ? docById : entryById).get(String(chunk?.sourceId));
+    // No match means the source was deleted; keep whatever the row already says
+    // rather than blanking a citation.
+    if (!source) return chunk;
+
+    // Documents own their name; a questionnaire's label was composed at index
+    // time from fields a document rename cannot touch.
+    const name = isDoc && source.name ? source.name : chunk.sourceName;
+    const date = source.date || '';
+    const savedAt = source.savedAt || '';
+
+    if (
+      name === chunk.sourceName &&
+      date === (chunk.sourceDate || '') &&
+      savedAt === (chunk.sourceSavedAt || '')
+    ) {
+      return chunk;
+    }
+
     changed = true;
-    return { ...chunk, sourceName: current };
+    return { ...chunk, sourceName: name, sourceDate: date, sourceSavedAt: savedAt };
   });
 
   return changed ? updated : chunks;

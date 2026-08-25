@@ -203,6 +203,7 @@ Serotonin-public/
 ├── amplify.yml                 ← Amplify build spec (backend + frontend)
 ├── customHttp.yml              ← security headers
 ├── AMPLIFY_SETUP.md            ← deployment + the auth to-do list
+├── docs/BACKEND_OPTIONS.md     ← alternatives to Amplify, and what a swap would cost
 ├── AUTO_REVIEW.md              ← how parsing, scoring and citation work
 ├── index.html
 └── package.json

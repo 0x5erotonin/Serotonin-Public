@@ -150,7 +150,10 @@ export async function autoReview(questions, options = {}) {
     const bestQa = candidates.find((c) => c.chunk.sourceType === 'qa') || null;
     const bestDoc = candidates.find((c) => c.chunk.sourceType === 'document') || null;
 
-    return classify({ question, position, bestQa, bestDoc, thresholds, semanticOn });
+    const classified = classify({ question, position, bestQa, bestDoc, thresholds, semanticOn });
+    // Everything else that could answer this question, one entry per source, so
+    // the reviewer can see what was not chosen and pick a different document.
+    return { ...classified, alternatives: alternativesFrom(candidates, thresholds) };
   });
 
   const summary = summarise(reviewed, {
@@ -218,6 +221,15 @@ function scoreCandidates({ question, questionVector, index, byId, chunkVectors }
   scored.sort((a, b) => b.score - a.score);
   return scored;
 }
+
+/**
+ * Bounds on the alternatives list. The floor is well below the suggest
+ * thresholds on purpose — an alternative is offered to a human who is already
+ * looking, not written into an answer box, so the bar is "might be relevant"
+ * rather than "confident enough to reuse".
+ */
+const ALTERNATIVE_FLOOR = 0.18;
+const ALTERNATIVE_LIMIT = 6;
 
 function methodLabel(lexicalScore, semanticScore) {
   const lexicalStrong = lexicalScore >= 0.35;
@@ -357,6 +369,11 @@ function suggestionFrom(candidate, kind) {
     sourceType: candidate.chunk.sourceType,
     sourceName: candidate.chunk.sourceName || '',
     sourceId: candidate.chunk.sourceId || '',
+    // Stamped by withCurrentSources at load time, so the reviewer can see
+    // whether the passage they are about to reuse came from the current version
+    // of a policy or from something imported a year ago.
+    sourceDate: candidate.chunk.sourceDate || '',
+    sourceSavedAt: candidate.chunk.sourceSavedAt || '',
     category: candidate.chunk.category || '',
     page: candidate.chunk.page ?? null,
     question: candidate.chunk.question || '',
@@ -367,6 +384,38 @@ function suggestionFrom(candidate, kind) {
     method: candidate.method,
     matchedOn: displayTerms(candidate.matchedOn, 5),
   };
+}
+
+/**
+ * The other sources that could answer this question.
+ *
+ * One entry per source document or questionnaire, not per passage: three
+ * passages from the same SOC 2 report are one choice, not three, and showing
+ * them as three is how a picker becomes unusable. The best-scoring passage
+ * represents its source.
+ *
+ * Kept to ALTERNATIVE_LIMIT above ALTERNATIVE_FLOOR, because a list that
+ * includes everything the index coincidentally touched is a list nobody reads.
+ */
+function alternativesFrom(candidates, thresholds) {
+  const bySource = new Map();
+  for (const candidate of candidates) {
+    if (candidate.score < ALTERNATIVE_FLOOR) continue;
+    const key = `${candidate.chunk.sourceType}:${candidate.chunk.sourceId}`;
+    // Candidates arrive sorted by score, so the first one wins its source.
+    if (!bySource.has(key)) bySource.set(key, candidate);
+    if (bySource.size >= ALTERNATIVE_LIMIT) break;
+  }
+  return [...bySource.values()].map((candidate) =>
+    suggestionFrom(
+      candidate,
+      candidate.chunk.sourceType === 'qa'
+        ? candidate.score >= thresholds.QA_AUTOFILL
+          ? 'reused'
+          : 'previous-answer'
+        : 'document',
+    ),
+  );
 }
 
 const qaSourceLabel = (chunk) =>

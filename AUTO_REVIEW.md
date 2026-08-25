@@ -304,3 +304,47 @@ The negative assertions are the ones that matter most. A matcher that finds
 something for every question is worse than useless here: it launders guesses as
 evidence. So the tests check that unrelated questions get nothing, that document
 passages are never auto-filled, and that thin evidence is downgraded.
+
+## Where an answer came from
+
+Every auto-filled or suggested answer records its source: the document or past
+questionnaire it was pulled from, the page where applicable, and **the date that
+source was added to the library**. The date is not decoration — an old SOC 2
+report and this year's will both match a question about encryption, and the
+scorer has no way to know which one is current. That judgement is the reviewer's,
+and it needs the date to be made.
+
+Sources are resolved at match time by `withCurrentSources` rather than read from
+the index rows, so a renamed document cites its new name and a re-uploaded one
+cites its new date without the index being rebuilt.
+
+### Changing the source
+
+When more than one source could answer a question, the review screen offers
+**Change source**. It lists one entry per source — not per passage, because three
+paragraphs of the same policy is one choice, not three — ordered by score, each
+with its date, match method and the passage itself.
+
+Choosing a past answer marks the question auto-filled. Choosing a policy document
+leaves it flagged: the passage was written to answer something else, so it is a
+draft until a human has read it against this question. That is the same rule the
+matcher applies on its own, and it is why documents are never auto-filled without
+being asked for.
+
+The candidate list lives only for the duration of a review run. It holds up to
+six full passages per question, which on a 261-question CAIQ is over a megabyte —
+several times DynamoDB's 400 KB item limit — so `trimQuestion` strips it before
+anything is written. The chosen source persists; the alternatives are rebuilt on
+the next run.
+
+### Passage boundaries
+
+Passages are cut on sentence boundaries where possible and word boundaries
+always. This used to be a character-count slice, which produced citations opening
+mid-word — "ative access to production" — and those fragments went into the
+lexical index as tokens that match nothing.
+
+Spreadsheets get one more rule: a workbook arrives as one line per row, so rows
+are the unit a passage is built from. Splitting a sheet on sentence boundaries
+put several unrelated controls in one citation and cut through the middle of
+them.

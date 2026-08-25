@@ -85,6 +85,29 @@ try {
   await page.click('button:has-text("Import 1 document")');
   await sleep(3500);
 
+  // A second document covering the same ground on purpose. One source is not a
+  // choice, so the source picker only appears when at least two sources can
+  // answer a question — this is what makes that path testable.
+  await page.click('button:has-text("Import")');
+  await page.waitForSelector('text=Access Control Policy', { timeout: 10000 });
+  await page.click('button:text-is("Access Control Policy")');
+  await page.setInputFiles('input[type="file"] >> nth=0', {
+    name: 'access-control-standard-2026.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from([
+      'Access Control Standard 2026',
+      '',
+      'Section 2 — Authentication',
+      'Multi-factor authentication is mandatory for all administrative access to production systems. Enforcement is through the corporate identity provider using FIDO2 security keys; SMS and voice factors are disabled outright.',
+      '',
+      'Section 3 — Cryptographic controls',
+      'Customer data is encrypted at rest with AES-256 and in transit with TLS 1.3. Key material is held in a managed key service and rotated annually.',
+    ].join('\n')),
+  });
+  await sleep(400);
+  await page.click('button:has-text("Import 1 document")');
+  await sleep(3500);
+
   const chunks = await ls('chunks');
   check(
     'importing a document indexes it into searchable passages',
@@ -93,7 +116,10 @@ try {
   );
   check(
     'passages carry their source document name',
-    (chunks || []).every((c) => c.sourceName === 'information-security-policy.txt'),
+    (chunks || []).some((c) => c.sourceName === 'information-security-policy.txt') &&
+      (chunks || []).some((c) => c.sourceName === 'access-control-standard-2026.txt') &&
+      (chunks || []).every((c) => !!c.sourceName),
+    [...new Set((chunks || []).map((c) => c.sourceName))].join(' | '),
   );
   check(
     'the document is marked searchable in the library',
@@ -195,6 +221,82 @@ try {
     /Globex/.test(mfa?.source || ''),
     mfa?.source,
   );
+  // Provenance an auto-filled answer has to carry: which source, and when that
+  // source landed, so a reviewer can tell a current policy from a stale one.
+  check(
+    'the auto-filled answer records the source it was pulled from',
+    !!mfa?.suggestion?.sourceName,
+    mfa?.suggestion?.sourceName,
+  );
+  check(
+    'the auto-filled answer carries the source date',
+    !!mfa?.suggestion?.sourceDate,
+    `sourceDate="${mfa?.suggestion?.sourceDate}"`,
+  );
+  // Alternatives are match-run state and must NOT be persisted: six full
+  // passages per question is over a megabyte on a large questionnaire, several
+  // times the DynamoDB item limit. `extracted` is read from storage, so their
+  // absence here is the assertion, and the picker itself is checked in the DOM.
+  check(
+    'alternatives are kept out of the stored record',
+    (mfa?.alternatives ?? []).length === 0,
+    `${mfa?.alternatives?.length ?? 0} stored on a record that must stay under 400 KB`,
+  );
+
+  const pickerButtons = page.locator('button:has-text("Change source")');
+  const pickerCount = await pickerButtons.count();
+  check(
+    'the review screen offers to change the source',
+    pickerCount >= 1,
+    `${pickerCount} question(s) offer a source picker`,
+  );
+
+  if (pickerCount > 0) {
+    await pickerButtons.first().click();
+    await sleep(600);
+    const pickerText = await page.locator('body').innerText();
+    check(
+      'the picker lists sources to choose from',
+      /answer from a different source/i.test(pickerText),
+    );
+    check(
+      'each listed source shows when it was added',
+      /added\s+\w/.test(pickerText),
+      pickerText.split('\n').find((l) => l.includes('added')) || 'no date line',
+    );
+    check(
+      'the source in use is marked as such',
+      pickerText.includes('IN USE') || pickerText.includes('In use'),
+    );
+    check(
+      'a listed source can be applied',
+      await page.locator('button:has-text("Use this answer")').first().isVisible(),
+    );
+    await pickerButtons.first().click();
+    await sleep(400);
+  }
+  check(
+    'the source name is shown on screen, not just held in state',
+    (await page.locator('body').innerText()).includes(mfa?.suggestion?.sourceName || ' '),
+    mfa?.suggestion?.sourceName,
+  );
+
+  // The reported truncation bug, checked end to end against real PDF.js output:
+  // a cited passage must not begin mid-word ("ative access to production").
+  const cited = extracted.filter((q) => (q.suggestion?.text || '').trim());
+  const fragments = cited.filter((q) => {
+    const opening = q.suggestion.text.trim().match(/^[A-Za-z][A-Za-z'-]*/);
+    if (!opening) return false;
+    // Compare against the document text the passage came from: if the opening
+    // token appears nowhere as a whole word, it is a fragment of one.
+    return !new RegExp(`\\b${opening[0]}\\b`, 'i').test(q.suggestion.text.slice(opening[0].length + 1) + ' ' + (q.text || ''))
+      && /^[a-z]/.test(q.suggestion.text.trim());
+  });
+  check(
+    'no cited passage opens with a lowercase word fragment',
+    fragments.length === 0,
+    fragments.map((q) => `"${q.suggestion.text.slice(0, 40)}…"`).join(' | '),
+  );
 
   const encryption = find('encrypted at rest');
   check(
@@ -278,12 +380,56 @@ try {
   });
   await sleep(1500);
   const xlsxText = await page.locator('body').innerText();
+  // Predates the spreadsheet reader, when the app could only say "export it as
+  // CSV". It reads .xlsx natively now, so a corrupt one has to fail on its own
+  // terms — naming what is wrong with the archive rather than the format.
   check(
-    'an .xlsx upload explains what to do instead of failing silently',
-    /export it as CSV/i.test(xlsxText),
-    xlsxText.split('\n').find((l) => /excel/i.test(l)) || 'no message',
+    'a corrupt .xlsx says what is actually wrong with it',
+    /not a zip archive|not an excel workbook|truncated or corrupt|could not be read/i.test(xlsxText),
+    xlsxText.split('\n').find((l) => /zip|archive|workbook|corrupt/i.test(l)) || 'no message',
   );
 
+  // A real .xls — the pre-2007 binary format — is a different failure with a
+  // different remedy, and the message has to say which.
+  await freshEditor();
+  await page.setInputFiles('input[type="file"] >> nth=0', {
+    name: 'legacy-questionnaire.xls',
+    mimeType: 'application/vnd.ms-excel',
+    buffer: Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0, 0, 0, 0]),
+  });
+  await sleep(2500);
+  const xlsText = await page.locator('body').innerText();
+  check(
+    'a legacy .xls upload says to re-save as .xlsx',
+    /save as \.xlsx/i.test(xlsText),
+    xlsText.split('\n').find((l) => /\.xls/i.test(l)) || 'no message',
+  );
+
+  // And a real workbook goes all the way through: the reader picks the
+  // questionnaire sheet and the question column out of a SIG-shaped file.
+  await freshEditor();
+  await page.setInputFiles('input[type="file"] >> nth=0', {
+    name: 'sig-questionnaire.xlsx',
+    mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    buffer: readFileSync('tests/fixtures/sig-questionnaire.xlsx'),
+  });
+  await page.waitForSelector('text=Review auto-filled answers', { timeout: 40000 });
+  await sleep(1500);
+  const sheetQuestions = (await page.evaluate(() =>
+    JSON.parse(localStorage.getItem('serotonin.v2.editorProgress') || 'null'),
+  ))?.questions || [];
+  check(
+    'a SIG-shaped workbook yields its questions',
+    sheetQuestions.length >= 8,
+    `${sheetQuestions.length} question(s)`,
+  );
+  check(
+    'the question column was used, not the reference or domain columns',
+    sheetQuestions.every((q) => q.text.length > 20 && !/^[A-Z]{2,3}-\d+$/.test(q.text.trim())),
+    sheetQuestions.slice(0, 3).map((q) => q.text.slice(0, 24)).join(' | '),
+  );
+
+  await freshEditor();
   await page.setInputFiles('input[type="file"] >> nth=0', {
     name: 'empty.txt',
     mimeType: 'text/plain',

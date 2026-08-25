@@ -80,10 +80,27 @@ AppSync, DynamoDB and S3 automatically.
 
 ### 2. Give the build role backend permissions
 
-In the Amplify console: **App settings → IAM roles**. The service role needs
-permission to deploy the backend stack. Amplify offers to create one on the
-first fullstack deploy — accept it. Without it the backend phase fails, no
-outputs file is written, and the app silently runs on device-only storage.
+In the Amplify console: **App settings → IAM roles** (older consoles:
+**General → Edit → Service role**). The service role needs permission to deploy
+the backend stack — the AWS managed policy `AmplifyBackendDeployFullAccess`
+covers it. Amplify offers to create the role on the first fullstack deploy;
+accept it.
+
+Without it the backend phase fails on an `AccessDenied` or
+`not authorized to perform: cloudformation:CreateStack`, no outputs file is
+written, and the app silently runs on device-only storage. This is the most
+common reason a Gen 2 backend never appears despite the build going green.
+
+> **Deploying with no local terminal.** You do not need the Amplify CLI on your
+> machine to provision the backend. `npx ampx sandbox` creates a *personal
+> development* stack; the branch backend is deployed by
+> `npx ampx pipeline-deploy`, which runs inside the AWS build container on every
+> push. A locked-down laptop with no Node and no admin rights is not a blocker —
+> pushing to the connected branch (the GitHub web UI counts) is the whole
+> deployment path. Amplify Gen 2 is code-first and has no click-to-add-resource
+> UI, so this build *is* the console equivalent. If you want an interactive shell
+> anyway, use **AWS CloudShell** — see "Provisioning without a local terminal"
+> below.
 
 ### 3. Add the SPA rewrite
 
@@ -197,6 +214,93 @@ briefly, the app has a real degraded mode, so deploying degraded beats not
 deploying at all while the backend is being brought up. **Once the backend deploys
 cleanly, change that block's `else` branch to `exit 1` to make it strict again**,
 or a later regression will silently drop every user to device-only storage.
+
+## Provisioning without a local terminal
+
+Amplify Gen 2 defines the backend in TypeScript — `amplify/storage/resource.ts`
+is the S3 bucket, `amplify/data/resource.ts` is the API and tables. There is no
+"add storage" button in the console the way Gen 1 had: in Gen 2 the code is the
+source of truth, and provisioning means getting that code deployed. So the
+question is not *which UI adds a bucket*, it is *what runs the deploy*.
+
+Three answers, none of which need software on your machine.
+
+**1. The Amplify Hosting build. Already set up; nothing to install.**
+
+Every push to the connected branch runs `npx ampx pipeline-deploy` inside AWS's
+own build container, which provisions Cognito, AppSync, DynamoDB and the S3
+bucket. Uploading files through the GitHub web UI triggers it just as well as
+`git push` does. If the backend is not appearing, the cause is in the build, not
+in your laptop:
+
+- Is a service role attached? (§2 above — the usual culprit.)
+- Does the build log contain `>>>>> STARTING BACKEND DEPLOY`? If not, the command
+  did not run at all.
+- If it ran and failed, the last 80 lines are printed after
+  `>>>>> BACKEND DEPLOY FAILED`.
+
+**2. AWS CloudShell — a terminal in the browser, inside the console.**
+
+Nothing is installed locally, and it runs as your console identity, so there are
+no AWS credentials to configure. Open the console and click the CloudShell icon
+in the top bar.
+
+**Get the code in without using git.** CloudShell has a file upload built in, and
+it avoids GitHub authentication altogether:
+
+**Actions → Upload file**, pick the project zip, then:
+
+```bash
+unzip ~/Serotonin-latest.zip -d /tmp/serotonin
+cd /tmp/serotonin
+npm install --include=dev
+npx ampx sandbox --once                    # your own isolated stack
+```
+
+> **Why not `git clone`?** GitHub dropped password authentication for Git in
+> August 2021, so an HTTPS clone of a *private* repo in a fresh environment fails
+> with `Invalid username or token. Password authentication is not supported for
+> Git operations.` Your laptop hides this — its credential manager has a token
+> cached — but CloudShell starts with nothing.
+>
+> A public repo clones anonymously and needs no credentials at all, so **if you
+> are being prompted for a username, GitHub is not serving that repo
+> anonymously**: it is private, or the owner/name in the URL is wrong. Check by
+> opening the URL in a private browser window.
+>
+> If it is private and you want git anyway, create a **fine-grained personal
+> access token** (GitHub → Settings → Developer settings → Personal access
+> tokens), scoped to that one repository with *Contents: Read-only* and a short
+> expiry, and paste it when prompted for the **password** — not your account
+> password. Do not put the token in the clone URL: it persists in
+> `.git/config` and in shell history. If you do not want to re-enter it, use
+> `git config --global credential.helper 'cache --timeout=3600'` rather than
+> `store`, which writes it in plaintext to `~/.git-credentials` — and CloudShell
+> keeps `$HOME` for about 120 days.
+
+Two other caveats. CloudShell persists only about 1 GB in `$HOME`, and this
+project's `node_modules` is larger than that with the CDK libraries — hence
+`/tmp`, which is roomier but wiped between sessions. And CloudShell inherits
+*your* IAM permissions: if your console identity cannot create CloudFormation
+stacks, this fails the same way a local CLI would, and the fix is an IAM one
+rather than a tooling one.
+
+`sandbox` builds a personal stack, separate from the branch backend. It is the
+fastest way to see a real error message, and `npx ampx sandbox delete` removes
+it.
+
+**3. A cloud dev environment** — GitHub Codespaces, Gitpod, or similar. Browser
+VS Code with a real shell. More setup than CloudShell, because you have to supply
+AWS credentials as environment secrets, but worth it if you will be iterating on
+the backend rather than deploying it once.
+
+**What about provisioning the bucket by hand?** You can create an S3 bucket and a
+Cognito identity pool in the console and hand-write `amplify_outputs.json` to
+match. It works, and I would not: you take on writing the CORS rules and IAM
+policies that `defineStorage` generates for you, the file is then a hand-edited
+artifact the build overwrites the moment the backend deploys properly, and the
+TypeScript definitions stop describing what is actually deployed. It trades a
+one-off blocker for permanent drift between code and infrastructure.
 
 ## Getting the full build log
 

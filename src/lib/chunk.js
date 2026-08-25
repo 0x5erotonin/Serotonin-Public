@@ -51,19 +51,110 @@ export function chunkPages(pages, fullText = '') {
   return chunks;
 }
 
+/* ── Boundary helpers ─────────────────────────────────────────────────────── */
+//
+// Every cut this file makes lands on a word boundary at minimum, and on a
+// sentence boundary where one is available. Slicing by raw character index is
+// what produced citations beginning mid-word — "ative access to production"
+// instead of "administrative access to production" — because the 120-character
+// overlap tail was taken with `slice(-120)` and simply started wherever that
+// landed. A citation whose first word is a fragment reads as corrupted data, and
+// it also poisons the lexical index: "ative" is a token that matches nothing.
+
 /**
- * Greedy accumulation over paragraphs, then sentences for anything oversized,
- * with a trailing overlap carried into the next passage.
+ * The smallest index at or after `index` that begins a whole word.
+ * Returns text.length if there is no boundary left (one very long token).
+ */
+function wordStartAt(text, index) {
+  if (index <= 0) return 0;
+  if (index >= text.length) return text.length;
+  if (/\s/.test(text[index - 1])) return index;
+  const next = text.slice(index).search(/\s/);
+  return next === -1 ? text.length : index + next + 1;
+}
+
+/**
+ * The largest index at or before `index` that ends a whole word, so a passage
+ * never stops mid-word either.
+ */
+function wordEndAt(text, index) {
+  if (index >= text.length) return text.length;
+  if (index <= 0) return 0;
+  if (/\s/.test(text[index])) return index;
+  const before = text.lastIndexOf(' ', index);
+  return before <= 0 ? index : before;
+}
+
+/**
+ * Where the carried-forward overlap should start.
+ *
+ * Prefers the first sentence boundary inside the overlap window, so the next
+ * passage opens on a complete sentence and reads as a citation rather than a
+ * fragment. Falls back to a word boundary when the window holds no sentence
+ * break at all.
+ */
+function overlapStart(text, size) {
+  if (text.length <= size) return 0;
+  const from = text.length - size;
+  const window = text.slice(from);
+  // ". " / "! " / "? " — the character after the break starts the sentence.
+  const match = window.match(/[.!?]["')\]]?\s+/);
+  if (match && match.index !== undefined) {
+    const candidate = from + match.index + match[0].length;
+    // Only worth it if a useful amount of text remains.
+    if (text.length - candidate >= 40) return candidate;
+  }
+  return wordStartAt(text, from);
+}
+
+/**
+ * The units a paragraph is built from, largest first.
+ *
+ * Newlines are a boundary before sentences are. A spreadsheet reaches this file
+ * as one line per row — `extract.js` joins cells with " | " and rows with "\n" —
+ * and with no blank lines the whole sheet is a single "paragraph". Splitting
+ * that on sentence boundaries put unrelated controls in one passage and cut
+ * through the middle of them; splitting on rows keeps each control intact. For
+ * prose, single newlines are line wraps, and breaking on them costs nothing
+ * because the accumulator below merges units back up to the target size.
+ */
+function unitsOf(paragraph) {
+  if (paragraph.length <= CHUNK_MAX) return [paragraph.replace(/\n+/g, ' ').trim()];
+
+  const units = [];
+  for (const line of paragraph.split('\n').map((l) => l.trim()).filter(Boolean)) {
+    if (line.length <= CHUNK_MAX) {
+      units.push(line);
+      continue;
+    }
+    const sentences = line.match(/[^.!?]+[.!?]+|\S[^.!?]*$/g) || [line];
+    for (const sentence of sentences) {
+      const trimmed = sentence.trim();
+      if (trimmed) units.push(trimmed);
+    }
+  }
+  return units;
+}
+
+/**
+ * Greedy accumulation over paragraphs, then rows or sentences for anything
+ * oversized, with a trailing overlap carried into the next passage.
  */
 function splitPassage(text) {
-  const paragraphs = text.split(/\n\s*\n+/).map((p) => p.replace(/\s+/g, ' ').trim()).filter(Boolean);
+  // Horizontal whitespace is collapsed, newlines are kept: unitsOf needs them.
+  const paragraphs = text
+    .split(/\n\s*\n+/)
+    .map((p) => p.replace(/[^\S\n]+/g, ' ').replace(/ *\n */g, '\n').trim())
+    .filter(Boolean);
+
   const out = [];
   let buffer = '';
 
   const flush = () => {
     if (buffer.trim().length >= MIN_CHUNK) out.push(buffer.trim());
-    // Carry the tail forward so a control split across a boundary still matches.
-    buffer = buffer.length > CHUNK_OVERLAP ? buffer.slice(-CHUNK_OVERLAP) : '';
+    // Carry the tail forward so a control split across a boundary still matches
+    // — starting at a sentence or word boundary, never mid-word.
+    buffer = buffer.length > CHUNK_OVERLAP ? buffer.slice(overlapStart(buffer, CHUNK_OVERLAP)) : '';
   };
 
   for (const paragraph of paragraphs) {
@@ -71,24 +162,27 @@ function splitPassage(text) {
     // be useful on its own — see PARAGRAPH_BREAK.
     if (buffer.trim().length >= PARAGRAPH_BREAK) flush();
 
-    // A paragraph longer than the max gets broken on sentence boundaries.
-    const pieces =
-      paragraph.length > CHUNK_MAX
-        ? paragraph.match(/[^.!?]+[.!?]+|\S[^.!?]*$/g) || [paragraph]
-        : [paragraph];
-
-    for (const piece of pieces) {
-      const candidate = buffer ? `${buffer} ${piece.trim()}` : piece.trim();
+    for (const piece of unitsOf(paragraph)) {
+      const candidate = buffer ? `${buffer} ${piece}` : piece;
       if (candidate.length > CHUNK_TARGET && buffer) {
         flush();
-        buffer = buffer ? `${buffer} ${piece.trim()}` : piece.trim();
+        buffer = buffer ? `${buffer} ${piece}` : piece;
       } else {
         buffer = candidate;
       }
-      // A single sentence longer than the hard max: emit it on its own.
+
+      // A single unit longer than the hard max — an unbroken wall of text with
+      // no row, sentence or paragraph structure — is emitted on its own.
       while (buffer.length > CHUNK_MAX) {
-        out.push(buffer.slice(0, CHUNK_MAX).trim());
-        buffer = buffer.slice(CHUNK_MAX - CHUNK_OVERLAP);
+        let end = wordEndAt(buffer, CHUNK_MAX);
+        // A token longer than the whole chunk has no boundary to find; cut it.
+        if (end < MIN_CHUNK) end = CHUNK_MAX;
+        out.push(buffer.slice(0, end).trim());
+
+        let resume = wordStartAt(buffer, Math.max(0, end - CHUNK_OVERLAP));
+        // Guarantee forward progress whatever the input looks like.
+        if (resume <= 0 || resume >= buffer.length) resume = end;
+        buffer = buffer.slice(resume).replace(/^\s+/, '');
       }
     }
   }

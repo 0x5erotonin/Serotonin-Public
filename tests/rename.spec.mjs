@@ -8,7 +8,7 @@
  *                         a path that ends at someone's filesystem. These cover
  *                         the hostile inputs and the merely annoying ones.
  *
- *   withCurrentSourceNames  Index rows store the document name denormalised for
+ *   withCurrentSources    Index rows store the document name and date denormalised for
  *                         citations. A rename must not leave auto-review quoting
  *                         a filename that no longer exists.
  *
@@ -16,7 +16,7 @@
  */
 
 import { normaliseDocName, extensionOf, MAX_DOC_NAME } from '../src/lib/docName.js';
-import { withCurrentSourceNames } from '../src/lib/sourceNames.js';
+import { withCurrentSources } from '../src/lib/sourceNames.js';
 
 let passed = 0;
 let failed = 0;
@@ -173,11 +173,14 @@ const once = normaliseDocName('  Q3:  Security  Report <v2>.pdf ', PREV);
 const twice = normaliseDocName(once, PREV);
 check('cleaning an already-clean name changes nothing', twice, once);
 
-/* ── withCurrentSourceNames ──────────────────────────────────────────────── */
+/* ── withCurrentSources ──────────────────────────────────────────────────── */
 
 const docs = [
-  { id: 'doc1', name: 'Access Control Policy 2026.pdf' },
-  { id: 'doc2', name: 'DR Plan.pdf' },
+  { id: 'doc1', name: 'Access Control Policy 2026.pdf', date: 'Aug 24, 2026', savedAt: '2026-08-24T09:00:00.000Z' },
+  { id: 'doc2', name: 'DR Plan.pdf', date: 'Jan 3, 2026', savedAt: '2026-01-03T09:00:00.000Z' },
+];
+const entries = [
+  { id: 'entry1', vendor: 'Acme Corp', date: 'Aug 2026', savedAt: '2026-08-01T09:00:00.000Z' },
 ];
 
 const chunks = [
@@ -187,40 +190,44 @@ const chunks = [
   { id: 'c4', sourceType: 'qa', sourceId: 'entry1', sourceName: 'Acme Corp · Aug 2026', question: 'q', text: 'd' },
 ];
 
-const refreshed = withCurrentSourceNames(chunks, docs);
+const refreshed = withCurrentSources(chunks, { docs, entries });
 
-check('a renamed document\'s citations use the new name', refreshed[0].sourceName, 'Access Control Policy 2026.pdf');
+check("a renamed document's citations use the new name", refreshed[0].sourceName, 'Access Control Policy 2026.pdf');
 check('every row of that document is updated', refreshed[1].sourceName, 'Access Control Policy 2026.pdf');
-check('an unrenamed document is left alone', refreshed[2].sourceName, 'DR Plan.pdf');
-check('a questionnaire row is not touched', refreshed[3].sourceName, 'Acme Corp · Aug 2026');
+check('an unrenamed document keeps its name', refreshed[2].sourceName, 'DR Plan.pdf');
+check('a questionnaire row keeps its composed label', refreshed[3].sourceName, 'Acme Corp · Aug 2026');
 checkThat('the passage text is not disturbed', refreshed.every((c, i) => c.text === chunks[i].text));
 checkThat('rows are not reordered or dropped', refreshed.length === chunks.length && refreshed[3].id === 'c4');
 
-checkThat(
-  'the original array is returned when nothing changed',
-  withCurrentSourceNames(chunks.slice(2), docs) === chunks.slice(2, 4) ||
-    withCurrentSourceNames([chunks[2], chunks[3]], docs)[0] === chunks[2],
-  'a no-op should not allocate a new row',
-);
+// The date is what lets a reviewer tell a current policy from a stale one.
+check('a document row is stamped with its upload date', refreshed[0].sourceDate, 'Aug 24, 2026');
+check('an older document carries its own date', refreshed[2].sourceDate, 'Jan 3, 2026');
+check('a questionnaire row is dated too', refreshed[3].sourceDate, 'Aug 2026');
+check('the sortable timestamp comes through', refreshed[0].sourceSavedAt, '2026-08-24T09:00:00.000Z');
 
-const deletedDoc = withCurrentSourceNames(
+const deletedSource = withCurrentSources(
   [{ id: 'c9', sourceType: 'document', sourceId: 'gone', sourceName: 'Deleted Report.pdf' }],
-  docs,
+  { docs, entries },
 );
 check(
   'a row whose document was deleted keeps its stored name',
-  deletedDoc[0].sourceName,
+  deletedSource[0].sourceName,
   'Deleted Report.pdf',
 );
 
-checkThat('no documents means no change', withCurrentSourceNames(chunks, []) === chunks);
-checkThat('no chunks is handled', withCurrentSourceNames([], docs).length === 0);
-checkThat('missing arguments are handled', withCurrentSourceNames().length === 0);
+checkThat('no sources means no change', withCurrentSources(chunks, { docs: [], entries: [] }) === chunks);
+checkThat('no chunks is handled', withCurrentSources([], { docs }).length === 0);
+checkThat('missing arguments are handled', withCurrentSources().length === 0);
 checkThat(
-  'a document with no name is ignored rather than blanking a citation',
-  withCurrentSourceNames(
+  'a second pass changes nothing',
+  withCurrentSources(refreshed, { docs, entries }) === refreshed,
+  'should return the same array when already current',
+);
+checkThat(
+  'a document with no name keeps the citation readable',
+  withCurrentSources(
     [{ id: 'c1', sourceType: 'document', sourceId: 'doc3', sourceName: 'Original.pdf' }],
-    [{ id: 'doc3', name: '' }],
+    { docs: [{ id: 'doc3', name: '', date: 'Feb 2, 2026' }] },
   )[0].sourceName === 'Original.pdf',
 );
 

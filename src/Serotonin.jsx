@@ -20,7 +20,7 @@ import { questionsFromSheets, describeReport } from './lib/gridQuestions.js';
 import { autoReview } from './lib/matcher.js';
 import {
   loadChunks, indexDocument, indexQaPairs, removeChunksFor,
-  indexCoverage, backfillIndex, withCurrentSourceNames,
+  indexCoverage, backfillIndex, withCurrentSources,
 } from './lib/kbIndex.js';
 
 // Serotonin v2.0
@@ -665,7 +665,7 @@ function ApprovalStep({ t, s, vendor, questions, onBack, onComplete, questionnai
 
 // ─── QUESTIONNAIRE EDITOR ─────────────────────────────────────────────────────
 
-function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = [], onSaveDraft, onDeleteDraft, profile, resumeDraftId, onClearResume, onReleaseAttachments }) {
+function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = [], kbEntries = [], onSaveDraft, onDeleteDraft, profile, resumeDraftId, onClearResume, onReleaseAttachments }) {
 
   // ── Load draft if resuming ─────────────────────────────────────
   const resumeDraft = resumeDraftId ? drafts.find(d => d.id === resumeDraftId) : null;
@@ -728,13 +728,23 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = []
    */
   const SUGGESTION_STORE_CHARS = 240;
   const trimQuestion = (q) => {
-    if (!q?.suggestion?.text) return q;
-    const passage = q.suggestion.text;
-    if (passage.length <= SUGGESTION_STORE_CHARS) return q;
+    if (!q) return q;
+
+    // `alternatives` never gets stored. It holds up to six full passages per
+    // question, which on a 261-question CAIQ is well over a megabyte — several
+    // times the DynamoDB item limit that the truncation below already exists to
+    // stay under. It is match-run state: the picker is available while reviewing,
+    // and re-running auto-review rebuilds it. The chosen source survives in
+    // `suggestion`, which is the part that has to persist.
+    const { alternatives, ...rest } = q;
+
+    if (!rest?.suggestion?.text) return rest;
+    const passage = rest.suggestion.text;
+    if (passage.length <= SUGGESTION_STORE_CHARS) return rest;
     return {
-      ...q,
+      ...rest,
       suggestion: {
-        ...q.suggestion,
+        ...rest.suggestion,
         text: `${passage.slice(0, SUGGESTION_STORE_CHARS).trim()}…`,
         truncated: true,
       },
@@ -927,9 +937,10 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = []
     setReviewSummary(null);
 
     try {
-      // Names are refreshed from the document records so a citation quotes what
-      // the document is called now, not what it was called when it was indexed.
-      const chunks = withCurrentSourceNames(await loadChunks(), kbDocs);
+      // Names and dates are refreshed from the source records, so a citation
+      // quotes what the document is called now — not what it was called when it
+      // was indexed — and carries the date the reviewer needs to judge it.
+      const chunks = withCurrentSources(await loadChunks(), { docs: kbDocs, entries: kbEntries });
       const { questions: reviewed, summary } = await autoReview(seeded, {
         chunks,
         onProgress: (stage, detail) => { if (isCurrent()) setReviewProgress({ stage, detail }); },
@@ -972,6 +983,47 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = []
         recommendation: null,
       };
     }));
+  };
+
+  /** Which question has its source picker open. One at a time. */
+  const [sourcePickerFor, setSourcePickerFor] = useState(null);
+
+  /**
+   * Answer a question from a source the reviewer picked themselves.
+   *
+   * Distinct from `acceptSuggestion`, which accepts the match the scorer chose.
+   * Here the human has looked at several candidates and decided, usually because
+   * the best-scoring passage came from an older document than the one they want
+   * to cite — which is the whole reason the picker shows dates.
+   *
+   * Status follows the same rule the matcher uses, and for the same reason:
+   * reusing a previous answer is a reuse, but text lifted out of a policy
+   * document is a draft nobody has read in this context yet, so it stays flagged
+   * for review rather than being marked as settled.
+   */
+  const useAlternative = (questionId, alternative) => {
+    if (!alternative) return;
+    setQuestions(prev => prev.map(q => {
+      if (q.id !== questionId) return q;
+      const isReuse = alternative.sourceType === 'qa';
+      return {
+        ...q,
+        answer: alternative.text || '',
+        confidence: alternative.score ?? q.confidence,
+        status: isReuse ? 'auto-filled' : 'flagged',
+        source: isReuse
+          ? `Previously answered — ${alternative.sourceName}`
+          : `${alternative.sourceName}${alternative.page ? ` · p.${alternative.page}` : ''}`,
+        suggestion: alternative,
+        flagReason: isReuse
+          ? null
+          : `Drafted from ${alternative.sourceName}${alternative.sourceDate ? ` (added ${alternative.sourceDate})` : ''}`,
+        recommendation: isReuse
+          ? null
+          : 'Read it against this question before approving — it was written for a different one.',
+      };
+    }));
+    setSourcePickerFor(null);
   };
 
   /**
@@ -1425,7 +1477,109 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = []
                   ))}
                   style={{ ...s.input, minHeight: 80, resize: 'vertical' }}
                 />
-                {q.source && <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3, marginTop: 8, display: 'flex', alignItems: 'center', gap: 4 }}><FileText size={11} />{q.source}</div>}
+                {/*
+                  Provenance. This used to be one line of text, and it only
+                  appeared when the matcher set `source` — an auto-filled answer
+                  showed nothing about where it came from, which is the case
+                  where it matters most, because nobody goes looking for the
+                  source of an answer that is already filled in.
+                */}
+                {(q.source || (q.alternatives || []).length > 0) && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
+                    {q.source && (
+                      <span style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3, display: 'flex', alignItems: 'center', gap: 4 }}>
+                        <FileText size={11} />{q.source}
+                      </span>
+                    )}
+                    {q.suggestion?.sourceDate && (
+                      <span
+                        title={`Source added ${q.suggestion.sourceDate}`}
+                        style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3, display: 'flex', alignItems: 'center', gap: 4 }}
+                      >
+                        <Calendar size={10} />{q.suggestion.sourceDate}
+                      </span>
+                    )}
+                    {(q.alternatives || []).length > 1 && (
+                      <button
+                        onClick={() => setSourcePickerFor(sourcePickerFor === q.id ? null : q.id)}
+                        aria-expanded={sourcePickerFor === q.id}
+                        style={{
+                          background: sourcePickerFor === q.id ? t.accentBg : 'transparent',
+                          border: `0.5px solid ${sourcePickerFor === q.id ? t.accent : t.border}`,
+                          borderRadius: 5, padding: '3px 9px', cursor: 'pointer',
+                          fontFamily: t.sansFont, fontSize: 10, fontWeight: 600,
+                          color: sourcePickerFor === q.id ? t.accent : t.text3,
+                        }}
+                      >
+                        {sourcePickerFor === q.id ? 'Hide sources' : `Change source (${q.alternatives.length})`}
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {/* ── Source picker ── */}
+                {sourcePickerFor === q.id && (
+                  <div style={{ background: t.bg3, border: `0.5px solid ${t.border}`, borderRadius: 6, padding: '12px 14px', marginTop: 10 }}>
+                    <div style={{ ...s.label, color: t.text2, marginBottom: 4 }}>Answer from a different source</div>
+                    <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3, marginBottom: 10, lineHeight: 1.5 }}>
+                      Everything in the knowledge base that could answer this, best match first, one entry per document. Check the date — the highest-scoring passage is not always the current one.
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {(q.alternatives || []).map(alt => {
+                        const inUse = q.suggestion && alt.chunkId === q.suggestion.chunkId;
+                        const applied = inUse && q.answer === alt.text;
+                        return (
+                          <div
+                            key={alt.chunkId}
+                            style={{
+                              background: t.bg, borderRadius: 6, padding: '10px 12px',
+                              border: `0.5px solid ${inUse ? t.accent : t.border}`,
+                            }}
+                          >
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
+                              <span style={s.pill(alt.sourceType === 'qa' ? t.doneBg : t.accentBg, alt.sourceType === 'qa' ? t.done : t.accentText)}>
+                                {alt.sourceType === 'qa' ? 'Past answer' : 'Document'}
+                              </span>
+                              <span style={{ fontFamily: t.sansFont, fontSize: 12, fontWeight: 600, color: t.text, overflowWrap: 'anywhere' }}>
+                                {alt.sourceName || 'Untitled source'}
+                              </span>
+                              {alt.page ? <span style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3 }}>p.{alt.page}</span> : null}
+                              {inUse && <span style={s.pill(t.accentBg, t.accentText)}>In use</span>}
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 6 }}>
+                              {alt.sourceDate && (
+                                <span style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3, display: 'flex', alignItems: 'center', gap: 3 }}>
+                                  <Calendar size={9} />added {alt.sourceDate}
+                                </span>
+                              )}
+                              <span style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3 }}>{alt.score}% · {alt.method}</span>
+                            </div>
+                            {alt.sourceType === 'qa' && alt.question && (
+                              <div style={{ fontFamily: t.sansFont, fontSize: 11, fontStyle: 'italic', color: t.text3, marginBottom: 5 }}>
+                                asked as: “{alt.question}”
+                              </div>
+                            )}
+                            <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text2, lineHeight: 1.6, marginBottom: 8, maxHeight: 96, overflowY: 'auto' }}>
+                              {alt.text}
+                            </div>
+                            <button
+                              onClick={() => useAlternative(q.id, alt)}
+                              disabled={applied}
+                              style={{
+                                ...s.accentBtn, fontSize: 11, padding: '5px 12px',
+                                display: 'inline-flex', alignItems: 'center', gap: 5,
+                                opacity: applied ? 0.45 : 1,
+                                cursor: applied ? 'default' : 'pointer',
+                              }}
+                            >
+                              <CheckCircle size={11} />{applied ? 'Currently used' : 'Use this answer'}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
                 {q.flagReason && (
                   <div style={{ background: q.status === 'needs-input' ? t.dangerBg : t.warnBg, border: `0.5px solid ${q.status === 'needs-input' ? t.danger : t.warn}`, borderRadius: 6, padding: '10px 12px', marginTop: 12 }}>
                     <div style={{ fontFamily: t.sansFont, fontSize: 11, fontWeight: 600, color: q.status === 'needs-input' ? t.dangerText : t.warnText, marginBottom: 4 }}>{q.flagReason}</div>
@@ -2818,6 +2972,13 @@ Serotonin searches your knowledge base and auto-fills answers. The stats panel s
 **Step 3 — Review**
 Edit any answer directly in the text fields. The status banner at the bottom tells you in real time how many questions are still unanswered and turns green when all are filled.
 
+**Choosing where an answer comes from**
+Under every answer, Serotonin names the source it used and the date that source was added. When more than one document or past questionnaire could answer a question, a "Change source" button appears: it lists each candidate — one entry per document, best match first — with its date, match score, and the passage itself, and one click swaps the answer over.
+
+Picking a past answer marks the question auto-filled, because reusing your own answer is a reuse. Picking a policy document leaves it flagged for review instead: that text was written for a different question, and somebody should read it against this one before it goes out.
+
+The list is built during the review run. Reload mid-questionnaire and the answers and their sources are still there, but the alternatives are rebuilt the next time auto-review runs — they are far too large to store.
+
 **Step 4 — Approve**
 Final review before sending. Attach supporting documents (SOC 2 reports, policies, BAAs) using the file upload area. You must either Send Email or Download PDF before marking complete — this ensures a copy exists outside the system.
 
@@ -3001,7 +3162,10 @@ Answers that are specific, accurate, and complete will be reused in future quest
 Name vendors consistently (e.g. always "Acme Corp" not sometimes "Acme" or "acme corp"). This makes filtering and searching more accurate.
 
 **Review flagged answers carefully**
-When an answer is flagged for review, take the time to verify and update it. An incorrect answer auto-filled into future questionnaires causes more work than writing it fresh.`,
+When an answer is flagged for review, take the time to verify and update it. An incorrect answer auto-filled into future questionnaires causes more work than writing it fresh.
+
+**Check the date on the source**
+Every auto-filled answer shows which document or past questionnaire it came from and when that source was added to the library. The highest-scoring match is not always the current one — an old SOC 2 report and this year's can both answer a question, and only one of them is right. If the date looks stale, use "Change source".`,
       },
       {
         id: 'assigning-work',
@@ -4696,7 +4860,7 @@ export default function Serotonin() {
    * `sourceName` used in citations; rather than rewriting up to 300 rows per
    * rename — each one a full-collection mirror write — the name is re-resolved
    * from the document record when the index is loaded for a review. See
-   * `withCurrentSourceNames` in src/lib/kbIndex.js.
+   * `withCurrentSources` in src/lib/kbIndex.js.
    */
   const renameKbDoc = (id, name) => {
     const doc = kbDocs.find(d => String(d.id) === String(id));
@@ -5044,7 +5208,7 @@ export default function Serotonin() {
         {/* Main content */}
         <main style={{ flex: 1, overflowY: 'auto', padding: '32px 36px 80px', scrollBehavior: 'smooth' }}>
           {module === 'dashboard' && <Dashboard t={t} s={s} onNavigate={setModule} kbEntries={kbEntries} drafts={drafts} onResumeDraft={(draft) => { setResumeDraftId(draft.id); setModule('editor'); }} profile={profile} onTransferOwner={transferDraftOwner} />}
-          {module === 'editor'    && <QuestionnaireEditor t={t} s={s} onBack={() => { setResumeDraftId(null); setModule('dashboard'); }} onAddToKb={addKbEntry} drafts={drafts} kbDocs={kbDocs} onSaveDraft={saveDraft} onDeleteDraft={deleteDraft} profile={profile} resumeDraftId={resumeDraftId} onClearResume={() => setResumeDraftId(null)} onReleaseAttachments={releaseAttachments} />}
+          {module === 'editor'    && <QuestionnaireEditor t={t} s={s} onBack={() => { setResumeDraftId(null); setModule('dashboard'); }} onAddToKb={addKbEntry} drafts={drafts} kbDocs={kbDocs} kbEntries={kbEntries} onSaveDraft={saveDraft} onDeleteDraft={deleteDraft} profile={profile} resumeDraftId={resumeDraftId} onClearResume={() => setResumeDraftId(null)} onReleaseAttachments={releaseAttachments} />}
           {module === 'vendor'    && <VendorDashboard t={t} s={s} />}
           {module === 'batch'     && <BatchProcessing t={t} s={s} />}
           {module === 'knowledge' && <KnowledgeBase t={t} s={s} kbEntries={kbEntries} kbDocs={kbDocs} onAddDoc={addKbDoc} onRemoveDoc={removeKbDoc} onRenameDoc={renameKbDoc} onDeleteEntry={deleteKbEntry} />}
