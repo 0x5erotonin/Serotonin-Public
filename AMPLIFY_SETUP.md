@@ -126,23 +126,53 @@ whole UI is built from inline styles and a token system rather than a stylesheet
 
 ## Troubleshooting the build
 
-**`npm error code EUSAGE` — "The `npm ci` command can only install with an
-existing package-lock.json"**
+**A command in `amplify.yml` never runs — no output, no error, no
+`# Executing command:` header**
 
-`npm ci` is the correct command for CI, but it refuses to run without a
-lockfile, and none was committed. Two fixes, and the first is better:
+Check whether that command block starts with a `#` comment line. One did, and
+Amplify skipped it silently: the backend phase reported success having never run
+`pipeline-deploy` at all, which is indistinguishable in the log from a backend
+that deployed and did nothing.
+
+Put explanations in YAML comments *outside* the block, before the `- |`, and
+start every command with a real statement. `amplify.yml` now echoes
+`>>>>> STARTING BACKEND DEPLOY` as its first line for exactly this reason — if
+that banner is absent from a log, the deploy did not run.
+
+**`npm error code EUSAGE` — "`npm ci` can only install packages when your
+package.json and package-lock.json are in sync"**
+
+Two different situations produce this, and they need different fixes.
+
+*No lockfile was committed.* `npm ci` refuses to run without one. Fix it
+properly:
 
 ```bash
-# 1. Commit a lockfile (also makes every future build reproducible)
 npm install
 git add package-lock.json && git commit -m "Add package-lock.json" && git push
 ```
 
-Or rely on the fallback now in `amplify.yml`, which uses `npm ci` when a lockfile
-exists and `npm install` when it does not. Either unblocks the build; committing
-the lockfile additionally pins exact versions, which is what you want for a
-security tool — without it, a transitive dependency can change between builds
-with no diff to review.
+*A lockfile appeared mid-build.* This one is subtler and cost a build. With no
+lockfile committed, the backend phase runs `npm install` — which writes a
+`package-lock.json` as a side effect. The frontend `preBuild` then sees a
+lockfile and picks `npm ci`, which rejects it:
+
+```
+npm error Invalid: lock file's semver@7.7.1 does not satisfy semver@7.8.5
+npm error Missing: @opentelemetry/core@2.0.0 from lock file
+```
+
+`npm install --prefer-offline` over a restored `node_modules` cache does not
+fully re-resolve the tree, so the lockfile it emits can disagree with
+`package.json`. `amplify.yml` now asks the right question — is a lockfile
+*committed* (`git ls-files`), not is one *present* — falls back to `npm install`
+if `npm ci` fails rather than failing the build, and skips the frontend install
+entirely when the backend phase already populated `node_modules` in the same
+container.
+
+Committing a lockfile is still the fix worth doing. Without one, a transitive
+dependency can change between builds with no diff to review — not a property you
+want in a security tool.
 
 **The backend phase fails on `npx ampx` with a missing module**
 
@@ -161,26 +191,78 @@ until Google SSO is wired up.
 The build log ends with a banner saying so, and the last line of the backend phase
 reports which storage the app will use.
 
-This is deliberate: the backend phase is followed by `|| echo …` in `amplify.yml`,
-so a backend failure is loud but does not abort the build. The reasoning is in the
-comment at the top of that file — briefly, the app has a real degraded mode, so
-deploying degraded beats not deploying at all while the backend is being brought
-up. **Once the backend deploys cleanly, delete the `|| echo …` to make it strict
-again**, or a later regression will silently drop every user to device-only
-storage.
+This is deliberate: the `pipeline-deploy` block in `amplify.yml` catches a failure
+rather than aborting. The reasoning is in the comment at the top of that file —
+briefly, the app has a real degraded mode, so deploying degraded beats not
+deploying at all while the backend is being brought up. **Once the backend deploys
+cleanly, change that block's `else` branch to `exit 1` to make it strict again**,
+or a later regression will silently drop every user to device-only storage.
 
-**Reading a truncated build log**
+## Getting the full build log
 
-The Amplify console truncates long logs in the browser. If the error is below the
-cut, either use the download-logs link on the build page, or skip the console
-entirely and reproduce it locally in about two minutes:
+This deserves its own section, because it has been the actual blocker: several
+builds in a row produced a log that ended mid-`npm warn deprecated`, which reads
+like a crash and is not one. **`npm warn` lines are warnings.** The console had
+simply stopped showing more, and the error was below the cut.
+
+`amplify.yml` now attacks that at the source: both `npm install` steps write to a
+file and print nothing unless they fail, which removes several hundred lines of
+noise from the log and should leave the real error visible. If a build still ends
+somewhere that is obviously not a failure, use one of these instead — in order of
+preference.
+
+**1. Reproduce it locally (best — full error, no AWS console involved).**
 
 ```bash
 npx ampx sandbox --once
 ```
 
-That runs the same validation and deployment against your own isolated stack, and
-prints the full error to your terminal. `npm run sandbox:delete` tears it down.
+Runs the same synth, validation and deployment against your own isolated stack and
+prints the whole error to your terminal. Nearly every backend failure — a bad
+`a.schema()` field, a handler wired up wrong, an IAM grant that will not resolve —
+fails here identically and immediately. `npm run sandbox:delete` tears it down.
+
+**2. Pull the log with the AWS CLI (full, untruncated, exposes nothing).**
+
+```bash
+APP=d2t1ylfcq4u0bz
+
+# Find the most recent build
+aws amplify list-jobs --app-id $APP --branch-name main --max-results 5 \
+  --query 'jobSummaries[].{id:jobId,status:status,at:startTime}' --output table
+
+# Grab the presigned log URLs for each step of that build
+aws amplify get-job --app-id $APP --branch-name main --job-id <JOB_ID> \
+  --query 'job.steps[].{step:stepName,status:status,log:logUrl}' --output text
+
+# Then fetch the BACKEND_BUILD step's URL — this is the complete log
+curl -s "<LOG_URL>" | tail -200
+curl -s "<LOG_URL>" > build.log     # or keep the whole thing and grep it
+```
+
+`grep -n '>>>>>' build.log` jumps straight to the failure banners the build spec
+prints.
+
+**3. Download it from the console.** The build page has a download link per phase.
+Same content as option 2, more clicking.
+
+**4. Publish it with the site (fastest, but public).** Set `PUBLISH_BUILD_LOG=1`
+in App settings → Environment variables and redeploy; the backend deploy log is
+copied into the site as `/backend-deploy.log`.
+
+> ⚠️ That file is world-readable, and CDK output contains your AWS account ID,
+> role ARNs, and stack and bucket names. Read it, then remove the variable and
+> redeploy. Options 1 and 2 leak nothing and are not much slower.
+
+**What to look for once you can read it.** The parts of this backend that were
+written without ever being executed, most likely first:
+
+- the custom `embedTexts` mutation and its `a.handler.function(embedText)` wiring
+- the Bedrock IAM grant added through the CDK escape hatch in `amplify/backend.ts`
+- `allow.entity('identity')` on the `user-files/{entity_id}/*` storage prefix
+- the custom Cognito attributes (`custom:department`, `custom:jobTitle`) —
+  attribute changes on an existing user pool are a known source of
+  `CREATE_FAILED` / immutable-property errors on redeploy
 
 ---
 
