@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   CheckSquare, Layers, BookOpen, Shield, Home, Settings,
   Bell, User, ChevronRight, Menu, X, ArrowLeft, Upload,
@@ -10,7 +10,10 @@ import {
 } from 'lucide-react';
 
 import { usePersistentList, usePersistentProfile, useLocalValue } from './lib/usePersisted.js';
-import { migrateLegacySessionState, recordAudit, deleteWhere } from './lib/store.js';
+import {
+  migrateLegacySessionState, recordAudit, deleteWhere,
+  ensureDeviceMigration, exportEverything, importEverything,
+} from './lib/store.js';
 import { uploadFile, removeFile, openFile, getFileUrl, formatBytes } from './lib/files.js';
 import { isAmplifyConfigured, whenReady } from './lib/amplifyClient.js';
 import { extractText, SUPPORTED_LABEL } from './lib/extract.js';
@@ -665,7 +668,7 @@ function ApprovalStep({ t, s, vendor, questions, onBack, onComplete, questionnai
 
 // ─── QUESTIONNAIRE EDITOR ─────────────────────────────────────────────────────
 
-function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = [], kbEntries = [], onSaveDraft, onDeleteDraft, profile, resumeDraftId, onClearResume, onReleaseAttachments }) {
+function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = [], kbEntries = [], knowledgeSignature = '', onSaveDraft, onDeleteDraft, profile, resumeDraftId, onClearResume, onReleaseAttachments }) {
 
   // ── Load draft if resuming ─────────────────────────────────────
   const resumeDraft = resumeDraftId ? drafts.find(d => d.id === resumeDraftId) : null;
@@ -853,6 +856,7 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = []
     questions:    questions.map(trimQuestion),
     manualText,
     assignee,
+    reviewedSignature: reviewedSignature.current || '',
     owner:        ownerName,
     ownerInitials:initialsOf(ownerName),
     progress:     questions.length > 0
@@ -950,6 +954,10 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = []
       if (!isCurrent()) return;
       setQuestions(reviewed);
       setReviewSummary(summary);
+      // This review *is* against the current library, so the watcher below has
+      // nothing to do until the library changes again.
+      reviewedSignature.current = knowledgeSignature;
+      persist({ reviewedSignature: knowledgeSignature });
     } catch (err) {
       if (!isCurrent()) return;
       console.warn('[serotonin] Auto-review failed — continuing without matches.', err);
@@ -968,6 +976,135 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = []
     }
   };
 
+  /* ── Keeping an open questionnaire current ──────────────────────────────
+   *
+   * Auto-review used to run exactly once, when the questionnaire was imported,
+   * and its verdicts were frozen into the questions and persisted. Import a
+   * policy document that answers question 7 and question 7 went on saying it
+   * needed a manual answer — through a refresh, through a reload, indefinitely,
+   * because a reload restores the stored verdict rather than re-running the
+   * matcher.
+   *
+   * So the review re-runs whenever the knowledge base changes underneath it.
+   * What that is allowed to touch is deliberately narrow:
+   *
+   *   unanswered and untouched  → filled in, because there is nothing to lose
+   *   answered, or touched      → left exactly as it is. If a new source would
+   *                               be a better match, that is surfaced as a
+   *                               marker on the question for the reviewer to
+   *                               look at, never as a silent rewrite
+   *
+   * Nobody should have to wonder whether the answer they are reading is still
+   * the one they approved. */
+  const [refreshing, setRefreshing]   = useState(false);
+  const [refreshNote, setRefreshNote] = useState(null); // { filled, updated }
+  const reviewedSignature = useRef(saved?.reviewedSignature || '');
+  const refreshRunRef = useRef(0);
+
+  // `questions` is read inside the async refresh below, which would otherwise
+  // close over whatever array existed when the callback was created.
+  const questionsRef = useRef(questions);
+  useEffect(() => { questionsRef.current = questions; }, [questions]);
+
+  /** Is `next` worth telling the reviewer about, given what they already have? */
+  const isWorthFlagging = (previous, next) => {
+    if (!next?.suggestion) return false;
+    // The same source as before is not news.
+    if (next.suggestion.chunkId === previous.suggestion?.chunkId) return false;
+    if (next.suggestion.sourceId && next.suggestion.sourceId === previous.suggestion?.sourceId) return false;
+    const scoreGain = (next.confidence || 0) - (previous.confidence || 0);
+    const newerSource =
+      !!next.suggestion.sourceSavedAt &&
+      next.suggestion.sourceSavedAt > (previous.suggestion?.sourceSavedAt || '');
+    // A clearly better match, or a comparable one from a more recent source —
+    // which is the case that matters when a policy has just been re-issued.
+    return scoreGain >= 5 || (newerSource && scoreGain >= -5);
+  };
+
+  const refreshAgainstKnowledgeBase = useCallback(async (signature) => {
+    const runId = refreshRunRef.current + 1;
+    refreshRunRef.current = runId;
+    const isCurrent = () => refreshRunRef.current === runId;
+
+    setRefreshing(true);
+    try {
+      const chunks = withCurrentSources(await loadChunks(), { docs: kbDocs, entries: kbEntries });
+      if (!isCurrent()) return;
+      if (chunks.length === 0) {
+        reviewedSignature.current = signature;
+        return;
+      }
+
+      const current = questionsRef.current;
+      const { questions: reviewed } = await autoReview(
+        current.map(q => ({ text: q.text })),
+        { chunks },
+      );
+      if (!isCurrent()) return;
+
+      let filled = 0;
+      let updated = 0;
+      const merged = current.map((q, index) => {
+        const next = reviewed[index];
+        if (!next) return q;
+
+        const hasAnswer = !!String(q.answer || '').trim();
+        if (!hasAnswer && !q.touched) {
+          // Nothing to lose here: take the new verdict whole.
+          if (next.status !== 'needs-input' || next.suggestion) filled += 1;
+          return { ...next, id: q.id, touched: false, update: null };
+        }
+
+        // Answered. The answer is not ours to change — but the picker should
+        // still know about the new sources, and a better match is worth saying.
+        const flag = isWorthFlagging(q, next);
+        if (flag) updated += 1;
+        return {
+          ...q,
+          alternatives: next.alternatives || q.alternatives,
+          update: flag
+            ? {
+                sourceName: next.suggestion.sourceName,
+                sourceDate: next.suggestion.sourceDate,
+                score: next.confidence,
+                previousScore: q.confidence || 0,
+              }
+            : q.update || null,
+        };
+      });
+
+      setQuestions(merged);
+      reviewedSignature.current = signature;
+      persist({ reviewedSignature: signature });
+      if (filled > 0 || updated > 0) setRefreshNote({ filled, updated });
+    } catch (err) {
+      console.warn('[serotonin] Could not refresh against the knowledge base.', err);
+    } finally {
+      if (isCurrent()) setRefreshing(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kbDocs, kbEntries]);
+
+  useEffect(() => {
+    if (!knowledgeSignature) return;
+    if (step !== 'review' && step !== 'approval') return;
+    if (questions.length === 0) return;
+    if (reviewedSignature.current === knowledgeSignature) return;
+    // An empty signature means this questionnaire was restored from storage and
+    // has never been checked against the current library — which is exactly the
+    // case worth checking. startProcessing records the signature itself, so a
+    // questionnaire that was just reviewed does not land here.
+    refreshAgainstKnowledgeBase(knowledgeSignature);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [knowledgeSignature, step, questions.length]);
+
+  // The notice is transient — it describes something that just happened.
+  useEffect(() => {
+    if (!refreshNote) return;
+    const timer = setTimeout(() => setRefreshNote(null), 12000);
+    return () => clearTimeout(timer);
+  }, [refreshNote]);
+
   /** Accept a suggested answer into the answer box. */
   const acceptSuggestion = (questionId) => {
     setQuestions(prev => prev.map(q => {
@@ -975,6 +1112,8 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = []
       return {
         ...q,
         answer: q.suggestion.text,
+        touched: true,
+        update: null,
         status: 'auto-filled',
         source: q.suggestion.sourceType === 'qa'
           ? `Previously answered — ${q.suggestion.sourceName}`
@@ -1009,6 +1148,8 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = []
       return {
         ...q,
         answer: alternative.text || '',
+        touched: true,
+        update: null,
         confidence: alternative.score ?? q.confidence,
         status: isReuse ? 'auto-filled' : 'flagged',
         source: isReuse
@@ -1415,6 +1556,32 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = []
           <div style={{ ...s.heroSerif, fontSize: 26, marginBottom: 24 }}>Review auto-filled answers,<br /><em style={{ color: t.heroMuted }}>resolve flagged items.</em></div>
 
           {/* What the auto-review actually did, including where it was limited */}
+          {/* Live status while the questionnaire is re-checked against a
+              knowledge base that changed under it. */}
+          {refreshing && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: t.accentBg, border: `0.5px solid ${t.accent}`, borderRadius: 8, padding: '10px 14px', marginBottom: 12 }}>
+              <Activity size={13} color={t.accent} />
+              <span style={{ fontFamily: t.sansFont, fontSize: 12, color: t.accentText }}>
+                The knowledge base changed — re-checking these questions against it…
+              </span>
+            </div>
+          )}
+          {!refreshing && refreshNote && (
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, background: t.doneBg, border: `0.5px solid ${t.done}`, borderRadius: 8, padding: '10px 14px', marginBottom: 12 }}>
+              <CheckCircle size={13} color={t.done} style={{ flexShrink: 0, marginTop: 1 }} />
+              <div style={{ fontFamily: t.sansFont, fontSize: 12, color: t.done, lineHeight: 1.5 }}>
+                Knowledge base updated.
+                {refreshNote.filled > 0 && ` ${refreshNote.filled} unanswered question${refreshNote.filled !== 1 ? 's' : ''} now ${refreshNote.filled !== 1 ? 'have' : 'has'} something to work from.`}
+                {refreshNote.updated > 0 && ` ${refreshNote.updated} answered question${refreshNote.updated !== 1 ? 's have' : ' has'} a newer source available — marked below, nothing was changed.`}
+              </div>
+              <button
+                onClick={() => setRefreshNote(null)}
+                style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.done, padding: 0, display: 'flex', flexShrink: 0, marginLeft: 'auto' }}
+              >
+                <X size={13} />
+              </button>
+            </div>
+          )}
           {reviewSummary && (
             <div style={{ ...s.card, padding: '14px 16px', marginBottom: 16 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: reviewSummary.semanticOn === false || reviewSummary.error ? 8 : 0 }}>
@@ -1466,6 +1633,26 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = []
                   {q.status === 'flagged' && <span style={s.pill(t.warnBg, t.warnText)}>Review</span>}
                   {q.status === 'needs-input' && <span style={s.pill(t.dangerBg, t.dangerText)}>Manual</span>}
                   {q.confidence > 0 && <span style={s.pill(t.bg3, t.text3)}>{q.confidence}% confidence</span>}
+                  {/*
+                    A newer or better source turned up after this question was
+                    answered. The answer is left alone — this is the whole of
+                    the intervention: say so, and open the picker on click.
+                  */}
+                  {q.update && (
+                    <button
+                      onClick={() => setSourcePickerFor(sourcePickerFor === q.id ? null : q.id)}
+                      title={`${q.update.sourceName}${q.update.sourceDate ? ` (added ${q.update.sourceDate})` : ''} now matches this question at ${q.update.score}%, against ${q.update.previousScore}% for the source currently used. Your answer has not been changed. Click to compare.`}
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 4,
+                        background: t.warnBg, border: `0.5px solid ${t.warn}`,
+                        borderRadius: 3, padding: '2px 7px', cursor: 'pointer',
+                        fontFamily: t.sansFont, fontSize: 9, fontWeight: 600,
+                        letterSpacing: '0.06em', textTransform: 'uppercase', color: t.warnText,
+                      }}
+                    >
+                      <AlertCircle size={9} />Newer source
+                    </button>
+                  )}
                 </div>
                 <div style={{ fontFamily: t.sansFont, fontSize: 13, fontWeight: 500, color: t.text, marginBottom: 10 }}>{q.text}</div>
                 {/* Controlled textarea — updates questions state on every keystroke */}
@@ -1473,7 +1660,9 @@ function QuestionnaireEditor({ t, s, onBack, onAddToKb, drafts = [], kbDocs = []
                   value={q.answer}
                   placeholder="Enter answer…"
                   onChange={e => setQuestions(prev => prev.map(p =>
-                    p.id === q.id ? { ...p, answer: e.target.value } : p
+                    // `touched` is what stops a background refresh from ever
+                    // reconsidering this question.
+                    p.id === q.id ? { ...p, answer: e.target.value, touched: true } : p
                   ))}
                   style={{ ...s.input, minHeight: 80, resize: 'vertical' }}
                 />
@@ -2017,7 +2206,7 @@ function BatchProcessing({ t, s }) {
 
 // ─── KNOWLEDGE BASE ───────────────────────────────────────────────────────────
 
-function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDoc, onRenameDoc, onDeleteEntry }) {
+function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDoc, onRenameDoc, onDeleteEntry, onIndexChanged }) {
   const [view,          setView]          = useState('library');
   const [viewMode,      setViewMode]      = useState('grid');
   const [search,        setSearch]        = useState('');
@@ -2035,6 +2224,68 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
   // Security panel so it describes what is actually running.
   const [amplifyOn, setAmplifyOn] = useState(isAmplifyConfigured());
   useEffect(() => { whenReady().then(setAmplifyOn); }, []);
+
+  // ── Backup ─────────────────────────────────────────────────────
+  // The only way to get a copy of the library out of the browser. It matters
+  // most in exactly the state this app spends most of its life in: no backend
+  // attached, so the single copy of everything is in one browser profile, one
+  // "clear site data" away from gone.
+  const [backupBusy, setBackupBusy]   = useState(null); // 'export' | 'import'
+  const [backupNote, setBackupNote]   = useState(null); // { kind, message }
+  const importInputRef = useRef(null);
+
+  const runExport = async () => {
+    setBackupBusy('export');
+    setBackupNote(null);
+    try {
+      const bundle = await exportEverything({
+        onProgress: ({ stage, detail }) => setBackupNote({ kind: 'info', message: `Collecting ${stage}: ${detail}` }),
+      });
+      const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `serotonin-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      // Revoked on a delay: revoking immediately can cancel the download in
+      // some browsers before it has read the blob.
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+      const records = Object.values(bundle.collections).reduce((sum, rows) => sum + rows.length, 0);
+      setBackupNote({
+        kind: 'done',
+        message: `Exported ${records} record${records !== 1 ? 's' : ''} and ${Object.keys(bundle.files).length} file${Object.keys(bundle.files).length !== 1 ? 's' : ''}.`,
+      });
+    } catch (err) {
+      setBackupNote({ kind: 'error', message: `Export failed: ${err?.message || err}` });
+    } finally {
+      setBackupBusy(null);
+    }
+  };
+
+  const runImport = async (file) => {
+    if (!file) return;
+    setBackupBusy('import');
+    setBackupNote(null);
+    try {
+      const bundle = JSON.parse(await file.text());
+      const summary = await importEverything(bundle, {
+        onProgress: ({ stage, detail }) => setBackupNote({ kind: 'info', message: `Restoring ${stage}: ${detail}` }),
+      });
+      setBackupNote({
+        kind: 'done',
+        message: `Restored ${summary.records} record${summary.records !== 1 ? 's' : ''} and ${summary.files} file${summary.files !== 1 ? 's' : ''}${summary.skipped ? `, skipped ${summary.skipped} already here` : ''}. Reloading…`,
+      });
+      // A reload rather than reconciling every list in place: the import wrote
+      // straight to the store, and half-refreshed screens are how people end up
+      // acting on data that is not there any more.
+      setTimeout(() => window.location.reload(), 1800);
+    } catch (err) {
+      setBackupNote({ kind: 'error', message: `Import failed: ${err?.message || err}` });
+      setBackupBusy(null);
+    }
+  };
 
   // ── Auto-review index coverage ─────────────────────────────────
   // Chunks are loaded here rather than at app boot: the embeddings make them
@@ -2073,6 +2324,9 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
     } finally {
       setBackfill(null);
       refreshIndex();
+      // A backfill changes the index without changing any document record, so
+      // nothing else would tell an open questionnaire to look again.
+      if (onIndexChanged) onIndexChanged();
     }
   };
   const [deleteConfirm, setDeleteConfirm] = useState(null); // entry to confirm-delete
@@ -2191,6 +2445,45 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
               <div style={{ ...s.label, color: t.accentText, marginBottom: 8 }}>Compliance certifications</div>
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                 {['SOC 2 Type II', 'ISO 27001', 'HIPAA', 'GDPR'].map(c => <span key={c} style={s.pill(t.bg2, t.accent)}>{c}</span>)}
+              </div>
+            </div>
+            <div style={{ marginTop: 16, paddingTop: 16, borderTop: `0.5px solid ${t.border}` }}>
+              <div style={{ ...s.label, marginBottom: 6 }}>Backup</div>
+              <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3, lineHeight: 1.5, marginBottom: 10 }}>
+                {amplifyOn
+                  ? 'Everything here, records and files, as one JSON file. Useful before a migration or a schema change.'
+                  : 'Your library exists only in this browser. Export it before clearing site data, switching browsers, or moving to a new domain — there is no other copy.'}
+              </div>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button
+                  onClick={runExport}
+                  disabled={!!backupBusy}
+                  style={{ ...s.accentBtn, fontSize: 11, padding: '6px 14px', display: 'inline-flex', alignItems: 'center', gap: 6, opacity: backupBusy ? 0.5 : 1 }}
+                >
+                  <Download size={12} />{backupBusy === 'export' ? 'Exporting…' : 'Export everything'}
+                </button>
+                <button
+                  onClick={() => importInputRef.current?.click()}
+                  disabled={!!backupBusy}
+                  style={{ ...s.ghostBtn, fontSize: 11, padding: '6px 14px', display: 'inline-flex', alignItems: 'center', gap: 6, opacity: backupBusy ? 0.5 : 1 }}
+                >
+                  <Upload size={12} />{backupBusy === 'import' ? 'Restoring…' : 'Restore a backup'}
+                </button>
+                <input
+                  ref={importInputRef}
+                  type="file"
+                  accept="application/json,.json"
+                  onChange={e => { const f = e.target.files?.[0]; e.target.value = ''; runImport(f); }}
+                  style={{ display: 'none' }}
+                />
+              </div>
+              {backupNote && (
+                <div style={{ fontFamily: t.sansFont, fontSize: 11, marginTop: 9, color: backupNote.kind === 'error' ? t.dangerText : backupNote.kind === 'done' ? t.done : t.text3 }}>
+                  {backupNote.message}
+                </div>
+              )}
+              <div style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3, marginTop: 8, lineHeight: 1.5 }}>
+                A restore is additive — a record already here is skipped, not replaced, so restoring an old backup cannot roll the library back.
               </div>
             </div>
             <div style={{ marginTop: 20, display: 'flex', justifyContent: 'flex-end' }}><button onClick={() => setShowStorage(false)} style={s.accentBtn}>Got it</button></div>
@@ -2972,6 +3265,16 @@ Serotonin searches your knowledge base and auto-fills answers. The stats panel s
 **Step 3 — Review**
 Edit any answer directly in the text fields. The status banner at the bottom tells you in real time how many questions are still unanswered and turns green when all are filled.
 
+**The questionnaire keeps up with the library**
+Auto-review runs when you import a questionnaire — but the knowledge base does not stand still. Import a policy document while a questionnaire is open and, when you come back to it, the questions are re-checked against the new material automatically. A notice at the top of the review step says what happened.
+
+What that re-check is allowed to do is deliberately narrow:
+
+- A question with no answer yet is filled in or given a suggestion. There is nothing to lose.
+- A question you have answered — auto-filled and accepted, or typed yourself — is never rewritten. If a newer or better-matching source has turned up, the question gets a **Newer source** marker instead. Hover it to see which document, when it was added, and how it scores against the one in use; click it to open the picker and compare.
+
+So an answer you have read and approved stays exactly as you left it, and you still find out when something changes.
+
 **Choosing where an answer comes from**
 Under every answer, Serotonin names the source it used and the date that source was added. When more than one document or past questionnaire could answer a question, a "Change source" button appears: it lists each candidate — one entry per document, best match first — with its date, match score, and the passage itself, and one click swaps the answer over.
 
@@ -3238,6 +3541,11 @@ If the app shows "Serotonin…" and doesn't load after 5 seconds, try a hard ref
 
 **I can't see documents I uploaded**
 Uploaded policy documents are listed under both Knowledge base → All entries and Knowledge base → Policy documents. If neither shows them, check whether a search term or tag filter is still applied — the count in the tab label tells you how many exist regardless of the filter.
+
+**How do I back up my library?**
+Knowledge base → Storage info → Export everything. You get one JSON file containing every record and every uploaded file. Restore it from the same panel. Worth doing before any change to where data lives — a new domain, a backend going live, or clearing your browser.
+
+With no backend attached your library exists in this browser and nowhere else. Clearing site data, switching browsers, or moving the app to a different domain all leave it behind.
 
 **Someone else on my team can't see my documents**
 Expected, for now. Sign-in is provisioned but not enforced, so every browser gets its own identity and records are scoped to whoever created them. Nothing is shared between people yet, on any network. AMPLIFY_SETUP.md has the options for changing that.`,
@@ -4882,10 +5190,74 @@ export default function Serotonin() {
     recordAudit('document.delete', 'KbDocument', id, { name: doc?.name });
   };
 
+  /**
+   * A cheap fingerprint of the knowledge base.
+   *
+   * The editor uses this to notice that the library changed underneath a
+   * questionnaire it has already reviewed. Deriving it from the document and
+   * entry records — which are already in memory — rather than from the index
+   * itself is deliberate: the index rows carry embeddings and run to thousands,
+   * and loading all of them to answer "has anything changed?" would cost more
+   * than the re-review it is guarding.
+   *
+   * `indexBump` covers the one case the records cannot see: a backfill that
+   * re-indexes existing documents without adding any.
+   */
+  const [indexBump, setIndexBump] = useState(0);
+  const knowledgeSignature = useMemo(() => {
+    const newest = [...kbDocs, ...kbEntries]
+      .map(row => row?.savedAt || '')
+      .reduce((latest, value) => (value > latest ? value : latest), '');
+    return `${kbDocs.length}:${kbEntries.length}:${newest}:${indexBump}`;
+  }, [kbDocs, kbEntries, indexBump]);
+
   // ── One-time migration off the old sessionStorage keys ──────────
   // Anyone who had the previous build open would otherwise lose their drafts
   // the moment this version loads.
   useEffect(() => { migrateLegacySessionState(); }, []);
+
+  /**
+   * The other one-time migration: device → cloud, the first time a backend is
+   * reachable.
+   *
+   * Everything created before a backend existed lives only in this browser, and
+   * nothing marks it as unsynced, because with no backend there was nothing to
+   * sync to. Left alone, the first successful read of an empty DynamoDB would
+   * become the new truth and the local copy would be overwritten. This uploads
+   * it first. `store.listAll` also refuses to overwrite an unsynced collection
+   * with an empty cloud result, so the two together mean a backend appearing can
+   * add data but never remove it.
+   */
+  const [cloudMigration, setCloudMigration] = useState(null); // { running, result }
+  useEffect(() => {
+    let cancelled = false;
+    whenReady().then((ready) => {
+      if (!ready || cancelled) return;
+      setCloudMigration({ running: true, result: null });
+      ensureDeviceMigration({
+        onProgress: ({ stage, detail, done, total }) => {
+          if (!cancelled) setCloudMigration({ running: true, result: null, stage, detail, done, total });
+        },
+      })
+        .then((result) => {
+          if (cancelled) return;
+          setCloudMigration(result.ran ? { running: false, result } : null);
+          if (result.ran) {
+            recordAudit('storage.migrate', 'Device', null, {
+              records: result.records,
+              files: result.files,
+              warnings: result.warnings.length,
+            });
+          }
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          console.warn('[serotonin] Device-to-cloud migration failed.', err);
+          setCloudMigration({ running: false, result: { ran: true, records: 0, files: 0, warnings: [String(err?.message || err)] } });
+        });
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   // Wrap setModule to also update the URL hash
   const setModule = (mod) => {
@@ -5207,11 +5579,47 @@ export default function Serotonin() {
 
         {/* Main content */}
         <main style={{ flex: 1, overflowY: 'auto', padding: '32px 36px 80px', scrollBehavior: 'smooth' }}>
+          {/* One-time device → cloud migration. Loud on purpose: it is the only
+              moment where data moves between two stores, and silence here is
+              how people find out too late that something did not make it. */}
+          {cloudMigration?.running && (
+            <div style={{ maxWidth: 900, margin: '0 auto 16px', display: 'flex', alignItems: 'center', gap: 10, background: t.accentBg, border: `0.5px solid ${t.accent}`, borderRadius: 8, padding: '12px 16px' }}>
+              <Activity size={14} color={t.accent} />
+              <span style={{ fontFamily: t.sansFont, fontSize: 12, color: t.accentText }}>
+                A cloud backend is now attached — moving this device's library into it
+                {cloudMigration.detail ? ` (${cloudMigration.detail})` : ''}
+                {cloudMigration.total ? ` · ${cloudMigration.done} of ${cloudMigration.total}` : ''}. Do not close this tab.
+              </span>
+            </div>
+          )}
+          {cloudMigration?.result?.ran && !cloudMigration.running && (
+            <div style={{ maxWidth: 900, margin: '0 auto 16px', background: cloudMigration.result.warnings.length ? t.warnBg : t.doneBg, border: `0.5px solid ${cloudMigration.result.warnings.length ? t.warn : t.done}`, borderRadius: 8, padding: '12px 16px' }}>
+              <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+                {cloudMigration.result.warnings.length
+                  ? <AlertTriangle size={14} color={t.warn} style={{ flexShrink: 0, marginTop: 1 }} />
+                  : <CheckCircle size={14} color={t.done} style={{ flexShrink: 0, marginTop: 1 }} />}
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontFamily: t.sansFont, fontSize: 12, fontWeight: 600, color: cloudMigration.result.warnings.length ? t.warnText : t.done, marginBottom: 3 }}>
+                    Moved to cloud storage — {cloudMigration.result.records} record{cloudMigration.result.records !== 1 ? 's' : ''} and {cloudMigration.result.files} file{cloudMigration.result.files !== 1 ? 's' : ''}.
+                  </div>
+                  <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3, lineHeight: 1.5 }}>
+                    Your library was held on this device only. It now lives in DynamoDB and S3 as well; the device copy was left in place.
+                  </div>
+                  {cloudMigration.result.warnings.slice(0, 5).map((w, i) => (
+                    <div key={i} style={{ fontFamily: t.sansFont, fontSize: 11, color: t.warnText, marginTop: 5 }}>• {w}</div>
+                  ))}
+                </div>
+                <button onClick={() => setCloudMigration(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.text3, padding: 0, display: 'flex', flexShrink: 0 }}>
+                  <X size={14} />
+                </button>
+              </div>
+            </div>
+          )}
           {module === 'dashboard' && <Dashboard t={t} s={s} onNavigate={setModule} kbEntries={kbEntries} drafts={drafts} onResumeDraft={(draft) => { setResumeDraftId(draft.id); setModule('editor'); }} profile={profile} onTransferOwner={transferDraftOwner} />}
-          {module === 'editor'    && <QuestionnaireEditor t={t} s={s} onBack={() => { setResumeDraftId(null); setModule('dashboard'); }} onAddToKb={addKbEntry} drafts={drafts} kbDocs={kbDocs} kbEntries={kbEntries} onSaveDraft={saveDraft} onDeleteDraft={deleteDraft} profile={profile} resumeDraftId={resumeDraftId} onClearResume={() => setResumeDraftId(null)} onReleaseAttachments={releaseAttachments} />}
+          {module === 'editor'    && <QuestionnaireEditor t={t} s={s} onBack={() => { setResumeDraftId(null); setModule('dashboard'); }} onAddToKb={addKbEntry} drafts={drafts} kbDocs={kbDocs} kbEntries={kbEntries} knowledgeSignature={knowledgeSignature} onSaveDraft={saveDraft} onDeleteDraft={deleteDraft} profile={profile} resumeDraftId={resumeDraftId} onClearResume={() => setResumeDraftId(null)} onReleaseAttachments={releaseAttachments} />}
           {module === 'vendor'    && <VendorDashboard t={t} s={s} />}
           {module === 'batch'     && <BatchProcessing t={t} s={s} />}
-          {module === 'knowledge' && <KnowledgeBase t={t} s={s} kbEntries={kbEntries} kbDocs={kbDocs} onAddDoc={addKbDoc} onRemoveDoc={removeKbDoc} onRenameDoc={renameKbDoc} onDeleteEntry={deleteKbEntry} />}
+          {module === 'knowledge' && <KnowledgeBase t={t} s={s} kbEntries={kbEntries} kbDocs={kbDocs} onAddDoc={addKbDoc} onRemoveDoc={removeKbDoc} onRenameDoc={renameKbDoc} onDeleteEntry={deleteKbEntry} onIndexChanged={() => setIndexBump(n => n + 1)} />}
           {module === 'wiki'      && <InternalWiki t={t} s={s} onNavigate={setModule} />}
         </main>
       </div>

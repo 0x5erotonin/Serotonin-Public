@@ -215,6 +215,51 @@ deploying at all while the backend is being brought up. **Once the backend deplo
 cleanly, change that block's `else` branch to `exit 1` to make it strict again**,
 or a later regression will silently drop every user to device-only storage.
 
+## What happens to existing data when the backend arrives
+
+Until `amplify_outputs.json` exists, the device **is** the store of record:
+records in `localStorage` under `serotonin.v2.*`, uploaded file bytes in
+IndexedDB (`serotonin-files`), referenced as `idb://…`. Nothing is server-side.
+A frontend redeploy cannot touch any of it — Amplify replaces static assets on a
+CDN, the origin does not change, and browser storage survives. What does lose it
+is a change of origin (a custom domain, a different branch URL — the data is
+still there, just unreachable), clearing site data, or Safari's ITP evicting
+script-writable storage after seven days without a visit.
+
+The dangerous moment is the deploy that finally attaches the backend, and it
+needed fixing rather than documenting:
+
+`putRecord` returns before marking anything dirty when there is no client —
+correctly, since there is nothing to sync to — so device-era records carry no
+"unsynced" marker. `listAll` then reads an empty DynamoDB, succeeds, and writes
+that empty result over the mirror. A successful read destroys the only copy that
+exists. The uploaded bytes survive in IndexedDB but are orphaned, because the
+records pointing at them are gone.
+
+Three things now stand between you and that:
+
+1. **A guard in `listAll`.** An empty cloud result cannot overwrite a collection
+   that has never been reconciled with AWS. The device copy is returned and a
+   warning is logged instead.
+2. **A migration, gated ahead of the first read.** On the first load with a
+   reachable backend, device records are uploaded and `idb://` files are
+   re-uploaded to S3 with their `storagePath` rewritten. It runs once per device,
+   merges by id — so a collection another device already populated gains this
+   device's records rather than being skipped or duplicated — and reports what it
+   did in a banner. `listAll` awaits it before its first read; without that gate
+   the read wins the race and there is nothing left to migrate.
+3. **Export and import.** Knowledge base → *Storage info* → **Export everything**
+   writes one JSON file with every record and every stored file inline. Restoring
+   is additive: a record already present is skipped, not replaced, so an old
+   backup cannot roll the library back.
+
+**Take an export before the first backend deploy.** The two mechanisms above are
+tested (`npm run test:migration`, 22 checks against a stubbed AppSync), but a
+backup costs one click and does not depend on my code being right.
+
+The migration test needs a reachable backend, so it is not part of
+`npm run test:browser`. Run it after `npx ampx sandbox`.
+
 ## Provisioning without a local terminal
 
 Amplify Gen 2 defines the backend in TypeScript — `amplify/storage/resource.ts`

@@ -42,6 +42,15 @@ const MIRROR_PREFIX = 'serotonin.v2.';
 const DIRTY_PREFIX = 'serotonin.v2.dirty.';
 const TOMB_PREFIX = 'serotonin.v2.tomb.';
 const SEEDED_PREFIX = 'serotonin.v2.seeded.';
+/**
+ * Set once a collection has been reconciled with AWS.
+ *
+ * Until then an empty result from AWS means "this collection has never been
+ * uploaded", not "this collection is empty" — and the difference decides whether
+ * overwriting the on-device copy destroys the only copy that exists.
+ */
+const SYNCED_PREFIX = 'serotonin.v2.synced.';
+const MIGRATED_KEY = 'serotonin.v2.migratedToCloud';
 const PAGE_LIMIT = 200;
 const MAX_PAGES = 25;
 
@@ -95,6 +104,9 @@ function markDirty(name, id, dirty) {
   else delete map[asId(id)];
   writeJson(`${DIRTY_PREFIX}${name}`, map);
 }
+
+const isSynced = (name) => readJson(`${SYNCED_PREFIX}${name}`, false) === true;
+const markSynced = (name) => writeJson(`${SYNCED_PREFIX}${name}`, true);
 
 function markTomb(name, id, tombstoned) {
   const map = readTombs(name);
@@ -160,6 +172,12 @@ export async function listAll(name) {
   const client = await getDataClient();
   if (!client) return sortRows(name, readMirror(name, []));
 
+  // Before any read is allowed to overwrite the mirror, the device's own
+  // records have to be in the cloud. Without this gate the first read wins the
+  // race against the migration, writes the cloud's view over the mirror, and
+  // the migration then finds nothing left to upload.
+  await ensureDeviceMigration();
+
   try {
     const ownerKey = await getOwnerKey();
     const model = client.models[def.model];
@@ -213,7 +231,28 @@ export async function listAll(name) {
       }
     }
 
+    // ── Never let an empty cloud wipe a full device ──────────────────────
+    //
+    // The mirror is normally a cache of what AWS holds, so overwriting it with
+    // a fresh read is right. It is NOT right the first time a backend appears:
+    // everything written before that was stored on the device alone and was
+    // never marked dirty (see putRecord — with no client there is nothing to
+    // sync to, so no retry is queued). A successful read of an empty table
+    // would then overwrite the only copy of the user's work with nothing.
+    //
+    // So an empty result is only allowed to overwrite the mirror once this
+    // collection has actually been reconciled with AWS.
+    const local = readMirror(name, []);
+    if (rows.length === 0 && local.length > 0 && !isSynced(name)) {
+      console.warn(
+        `[serotonin] AWS returned no "${name}" records but ${local.length} exist on this device, ` +
+          'and they have never been uploaded. Keeping the device copy — run the migration to upload them.',
+      );
+      return sortRows(name, local);
+    }
+
     writeMirror(name, rows);
+    markSynced(name);
     return sortRows(name, rows);
   } catch (err) {
     console.warn(`[serotonin] Could not load "${name}" from AWS — using the on-device mirror.`, err);
@@ -607,4 +646,329 @@ export async function migrateLegacySessionState() {
     console.info('[serotonin] Migrated legacy session data into durable storage:', migrated);
   }
   return migrated;
+}
+
+/* ── Device → cloud migration ─────────────────────────────────────────────── */
+
+/**
+ * Move everything held on this device into AWS, once, the first time a backend
+ * is actually reachable.
+ *
+ * Why this has to exist: with no `amplify_outputs.json` the device *is* the
+ * store of record. `putRecord` returns early before marking anything dirty,
+ * because there is nothing to sync to — so when a backend finally deploys there
+ * is no retry queue to drain and nothing to tell the store that these records
+ * have never been uploaded. Without this, the first successful read from an
+ * empty DynamoDB would be treated as the truth.
+ *
+ * Runs at most once per device (`MIGRATED_KEY`), and only uploads a collection
+ * that is empty in AWS — so it can never duplicate records or overwrite work
+ * done on another device that got there first.
+ *
+ * File bytes are moved too. A KbDocument whose `storagePath` still points at
+ * `idb://` would otherwise be listed in a cloud-backed library while its bytes
+ * sat in one browser's IndexedDB, which looks exactly like a working document
+ * until someone else clicks it.
+ *
+ * @param onProgress  called with { stage, detail, done, total }
+ * @returns { ran, records, files, warnings }
+ */
+let migrationPromise = null;
+const migrationWatchers = new Set();
+
+/**
+ * Run the device → cloud migration exactly once per page load, whoever asks.
+ *
+ * Both the store (before its first read) and the UI (to show progress) need
+ * this to have happened; memoising it means they cannot run two copies against
+ * each other. Progress is fanned out to every caller that asked for it.
+ */
+export function ensureDeviceMigration({ onProgress } = {}) {
+  if (onProgress) migrationWatchers.add(onProgress);
+  if (!migrationPromise) {
+    migrationPromise = migrateDeviceToCloud({
+      onProgress: (update) => {
+        for (const watcher of migrationWatchers) {
+          try { watcher(update); } catch { /* a broken listener must not stop the migration */ }
+        }
+      },
+    }).catch((err) => {
+      console.warn('[serotonin] Device-to-cloud migration failed.', err);
+      return { ran: true, records: 0, files: 0, warnings: [String(err?.message || err)] };
+    });
+  }
+  return migrationPromise;
+}
+
+export async function migrateDeviceToCloud({ onProgress = () => {} } = {}) {
+  const result = { ran: false, records: 0, files: 0, warnings: [] };
+
+  const client = await getDataClient();
+  if (!client) return result;                        // still device-only
+  if (readJson(MIGRATED_KEY, false) === true) return result;
+
+  const names = Object.keys(COLLECTIONS);
+  const pending = names.filter((name) => readMirror(name, []).length > 0);
+
+  if (pending.length === 0) {
+    // Nothing to move. Mark it done so this never runs again, and let the
+    // collections be treated as reconciled.
+    writeJson(MIGRATED_KEY, true);
+    for (const name of names) markSynced(name);
+    return result;
+  }
+
+  result.ran = true;
+  onProgress({ stage: 'starting', detail: 'Checking what is already in the cloud', done: 0, total: pending.length });
+
+  let index = 0;
+  for (const name of pending) {
+    index += 1;
+    const local = readMirror(name, []);
+    onProgress({ stage: 'records', detail: name, done: index, total: pending.length });
+
+    try {
+      // Merge by id rather than filling only an empty collection.
+      //
+      // Skipping a collection that already had rows looked safe and was not:
+      // if another device synced first, this device's records — which exist
+      // nowhere else — would be skipped here and then overwritten by the next
+      // read, because a non-empty cloud result bypasses the guard in listAll.
+      // Uploading only the ids the cloud does not have avoids both the loss and
+      // any duplication.
+      const remoteIds = await listRemoteIds(client, name);
+      const missing = local.filter((record) => !remoteIds.has(asId(record.id)));
+
+      for (const record of missing) {
+        await putRecord(name, record);
+        result.records += 1;
+      }
+      if (missing.length < local.length) {
+        result.warnings.push(
+          `${name}: ${local.length - missing.length} record(s) were already in the cloud and were left as they are.`,
+        );
+      }
+      markSynced(name);
+    } catch (err) {
+      result.warnings.push(`${name}: ${err?.message || err}`);
+    }
+  }
+
+  // Files second: the records now exist, so a rewritten storagePath lands on a
+  // row that is already in the cloud.
+  try {
+    const moved = await migrateDeviceFiles(onProgress);
+    result.files = moved.count;
+    result.warnings.push(...moved.warnings);
+  } catch (err) {
+    result.warnings.push(`files: ${err?.message || err}`);
+  }
+
+  // Marked done even with warnings. A second automatic pass would re-upload
+  // whatever succeeded the first time; the warnings say what needs a human.
+  writeJson(MIGRATED_KEY, true);
+  onProgress({ stage: 'done', detail: '', done: pending.length, total: pending.length });
+  return result;
+}
+
+/** Every record id this owner already has in AWS for one collection. */
+async function listRemoteIds(client, name) {
+  const def = collection(name);
+  const ownerKey = await getOwnerKey();
+  const model = client.models[def.model];
+  const ids = new Set();
+  let nextToken = null;
+  let pages = 0;
+  const maxPages = def.maxPages ?? MAX_PAGES;
+
+  do {
+    const { data, errors, nextToken: token } = await model.list({
+      filter: { ownerKey: { eq: ownerKey } },
+      limit: PAGE_LIMIT,
+      nextToken,
+    });
+    if (errors?.length) throw new Error(errors.map((e) => e.message).join('; '));
+    for (const row of data || []) ids.add(asId(row.id));
+    nextToken = token ?? null;
+    pages += 1;
+  } while (nextToken && pages < maxPages);
+
+  // A truncated read here would make records look absent and re-upload them.
+  // They are keyed by id so nothing duplicates, but say so rather than hide it.
+  if (nextToken) {
+    throw new Error(
+      `more than ${maxPages * PAGE_LIMIT} records already in the cloud — migration stopped rather than risk a partial comparison`,
+    );
+  }
+  return ids;
+}
+
+/**
+ * Re-upload `idb://` files to S3 and repoint the records at them.
+ *
+ * Imported lazily so the store does not pull the storage layer into every build
+ * that never migrates.
+ */
+async function migrateDeviceFiles(onProgress) {
+  const out = { count: 0, warnings: [] };
+  const { fetchStoredFile, uploadFile } = await import('./files.js');
+
+  const targets = [
+    { name: 'kbDocs', folder: 'kb-documents' },
+    { name: 'attachments', folder: 'attachments' },
+  ];
+
+  for (const { name, folder } of targets) {
+    const rows = readMirror(name, []).filter((row) => String(row.storagePath || '').startsWith('idb://'));
+    let done = 0;
+    for (const row of rows) {
+      done += 1;
+      onProgress({ stage: 'files', detail: row.name || name, done, total: rows.length });
+      try {
+        const file = await fetchStoredFile(row.storagePath, row.name || 'document');
+        if (!file) {
+          out.warnings.push(`${row.name || row.id}: the stored bytes could not be read, so the record still points at this device.`);
+          continue;
+        }
+        const uploaded = await uploadFile(file, { folder });
+        if (uploaded.error || !uploaded.storagePath || uploaded.storagePath.startsWith('idb://')) {
+          out.warnings.push(`${row.name || row.id}: upload failed (${uploaded.error || 'no path returned'}).`);
+          continue;
+        }
+        await putRecord(name, { ...row, storagePath: uploaded.storagePath });
+        out.count += 1;
+      } catch (err) {
+        out.warnings.push(`${row.name || row.id}: ${err?.message || err}`);
+      }
+    }
+  }
+  return out;
+}
+
+/* ── Export / import ──────────────────────────────────────────────────────── */
+
+/** Everything this device holds, as one portable object. */
+export async function exportEverything({ includeFiles = true, onProgress = () => {} } = {}) {
+  const bundle = {
+    format: 'serotonin.backup',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    collections: {},
+    profile: readJson(`${MIRROR_PREFIX}${PROFILE_COLLECTION}`, null),
+    files: {},
+  };
+
+  for (const name of Object.keys(COLLECTIONS)) {
+    onProgress({ stage: 'records', detail: name });
+    // Read through the store rather than the mirror, so an AWS-backed device
+    // exports what the server holds rather than a possibly partial cache.
+    try {
+      bundle.collections[name] = await listAll(name);
+    } catch {
+      bundle.collections[name] = readMirror(name, []);
+    }
+  }
+
+  if (includeFiles) {
+    const { fetchStoredFile } = await import('./files.js');
+    const withFiles = [
+      ...(bundle.collections.kbDocs || []),
+      ...(bundle.collections.attachments || []),
+    ].filter((row) => row.storagePath);
+
+    let done = 0;
+    for (const row of withFiles) {
+      done += 1;
+      onProgress({ stage: 'files', detail: row.name || row.id, done, total: withFiles.length });
+      try {
+        const file = await fetchStoredFile(row.storagePath, row.name || 'document');
+        if (!file) continue;
+        bundle.files[row.storagePath] = {
+          name: row.name || 'document',
+          contentType: file.type || 'application/octet-stream',
+          base64: await fileToBase64(file),
+        };
+      } catch (err) {
+        console.warn(`[serotonin] Could not include "${row.name}" in the export.`, err);
+      }
+    }
+  }
+
+  return bundle;
+}
+
+/**
+ * Restore a bundle.
+ *
+ * Additive by default: a record whose id already exists is skipped rather than
+ * overwritten, so importing a backup into a library that has moved on does not
+ * roll it back. Pass `overwrite` to replace instead.
+ */
+export async function importEverything(bundle, { overwrite = false, onProgress = () => {} } = {}) {
+  const summary = { records: 0, files: 0, skipped: 0, warnings: [] };
+  if (!bundle || bundle.format !== 'serotonin.backup') {
+    throw new Error('That file is not a Serotonin backup.');
+  }
+
+  const { uploadFile } = await import('./files.js');
+  const pathMap = new Map();
+
+  // Files first, so records can be written already pointing at the new paths.
+  const fileEntries = Object.entries(bundle.files || {});
+  let fileIndex = 0;
+  for (const [originalPath, payload] of fileEntries) {
+    fileIndex += 1;
+    onProgress({ stage: 'files', detail: payload?.name || originalPath, done: fileIndex, total: fileEntries.length });
+    try {
+      const file = base64ToFile(payload.base64, payload.name, payload.contentType);
+      const folder = originalPath.includes('attachments') ? 'attachments' : 'kb-documents';
+      const uploaded = await uploadFile(file, { folder });
+      if (uploaded.storagePath) {
+        pathMap.set(originalPath, uploaded.storagePath);
+        summary.files += 1;
+      }
+    } catch (err) {
+      summary.warnings.push(`${payload?.name || originalPath}: ${err?.message || err}`);
+    }
+  }
+
+  for (const [name, rows] of Object.entries(bundle.collections || {})) {
+    if (!COLLECTIONS[name] || !Array.isArray(rows)) continue;
+    onProgress({ stage: 'records', detail: name });
+    const existing = new Set((await listAll(name)).map((row) => asId(row.id)));
+    for (const row of rows) {
+      if (!overwrite && existing.has(asId(row.id))) {
+        summary.skipped += 1;
+        continue;
+      }
+      try {
+        const storagePath = pathMap.get(row.storagePath) || row.storagePath;
+        await putRecord(name, { ...row, storagePath });
+        summary.records += 1;
+      } catch (err) {
+        summary.warnings.push(`${name}/${row.id}: ${err?.message || err}`);
+      }
+    }
+  }
+
+  return summary;
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const value = String(reader.result || '');
+      resolve(value.slice(value.indexOf(',') + 1));
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+function base64ToFile(base64, name, contentType) {
+  const binary = atob(String(base64 || ''));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return new File([bytes], name || 'document', { type: contentType || 'application/octet-stream' });
 }

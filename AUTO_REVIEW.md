@@ -348,3 +348,50 @@ Spreadsheets get one more rule: a workbook arrives as one line per row, so rows
 are the unit a passage is built from. Splitting a sheet on sentence boundaries
 put several unrelated controls in one citation and cut through the middle of
 them.
+
+## Staying current with the knowledge base
+
+Auto-review runs at import, and its verdicts are written into the questions and
+persisted. That is what makes a draft survive a refresh — and it is also why an
+open questionnaire used to ignore the knowledge base growing underneath it. A
+document imported after the review changed nothing, through a refresh or a
+reload, because a reload restores the stored verdict rather than re-running the
+matcher.
+
+The editor now watches a cheap fingerprint of the library — document and entry
+counts plus the newest `savedAt`, derived from records already in memory rather
+than from the index, which carries embeddings and runs to thousands of rows. When
+that fingerprint differs from the one the questionnaire was last reviewed
+against, the review re-runs in the background.
+
+The merge rule is the part worth being careful about:
+
+| State of the question | What the refresh does |
+|---|---|
+| No answer, never edited | Takes the new verdict whole — answer, status, citation |
+| Answered, or edited by a human | **Nothing.** The answer is not touched |
+
+An answered question that a newer source would match better gets a `update`
+marker rather than a rewrite: which document, when it was added, and its score
+against the one in use, shown as a hover tooltip and a click-through to the
+source picker. A compliance answer somebody has read and approved must not change
+because a file was uploaded in another tab.
+
+`touched` is set the moment a reviewer types in the box, accepts a suggestion, or
+picks a source, and it is what makes the second row of that table hold. The
+fingerprint the review ran against is persisted with the draft, so resuming a
+questionnaire days later — on another device — still notices what has changed
+since.
+
+### What "real time" does and does not mean here
+
+Within a browser this is live: the fingerprint updates as soon as indexing
+finishes, and the questionnaire reacts without a reload. Backfilling the index
+bumps it explicitly, since re-indexing existing documents changes no record.
+
+It is not push. A document imported by a colleague on another machine will not
+appear until this browser reloads its records. Doing that properly means AppSync
+subscriptions on the `KbIndexChunk` and `KbDocument` models — a real-time
+transport the store layer does not use today, and which needs the backend
+deployed first. Every browser is also its own guest identity until auth is
+enforced, so there is no shared library to be notified about yet.

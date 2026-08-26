@@ -13,8 +13,9 @@
     "sandbox:delete": "ampx sandbox delete",
     "test": "npm run test:unit",
     "test:unit": "node tests/extraction.spec.mjs && node tests/matching.spec.mjs && node tests/xlsx.spec.mjs && node tests/rename.spec.mjs && node tests/chunking.spec.mjs",
-    "test:browser": "node tests/persistence.spec.mjs && node tests/autoreview.spec.mjs && node tests/ownership.spec.mjs",
-    "fixtures": "node tests/fixtures/make-xlsx.mjs"
+    "test:browser": "node tests/persistence.spec.mjs && node tests/autoreview.spec.mjs && node tests/ownership.spec.mjs && node tests/liveindex.spec.mjs",
+    "fixtures": "node tests/fixtures/make-xlsx.mjs",
+    "test:migration": "node tests/migration.spec.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.43.0",
