@@ -27,6 +27,8 @@ Then it happens again next month. And the month after that.
 
 **📊 It handles the spreadsheets** — A SIG or CAIQ workbook is a cover page, an instructions tab, a glossary, the questionnaire, and usually an old version nobody deleted. Serotonin works out which sheet is the questionnaire and which column holds the questions — they're rarely in column A — skips the rest, and tells you exactly what it picked: *"used column C ("Question") of "Full Questionnaire" — skipped "Instructions" (looks like guidance), "Glossary" (looks like a glossary)"*.
 
+**📥 Bulk import and export** — Drop thirty policies at once, or a .zip of them; each file's category is guessed from its name and editable before it lands, one bad file is reported rather than taking the batch down, and progress is per file. Export the whole library as a restorable JSON backup, or the answer history and document manifest as CSV.
+
 **🧠 Knowledge base** — Every questionnaire you complete gets indexed and searchable, and so does every policy document you import: SOC 2 reports, access control policies, disaster recovery plans are split into passages, embedded, and cited by page. One library, one search — completed questionnaires and imported documents sit side by side under *All entries*, and documents can be renamed in place without re-uploading or re-indexing. Genuinely gets better with every questionnaire you run through it, because your own answers become the best match for next time.
 
 **🗂 Dashboard** — See everything in flight at a glance. Who owns what, where it's at in the workflow, how complete it is, who it's assigned to. Hand an assessment to a colleague with the Transfer button. One click to pick up where you left off.

@@ -1,0 +1,47 @@
+[
+  {
+    "name": "app boots to the dashboard",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "manual entry accepts questions",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "draft written to durable storage",
+    "passed": true,
+    "detail": "1 draft(s), vendor=Acme Corp"
+  },
+  {
+    "name": "draft carries all three questions",
+    "passed": true,
+    "detail": "questions=3"
+  },
+  {
+    "name": "draft survives a refresh",
+    "passed": true,
+    "detail": "1 draft(s)"
+  },
+  {
+    "name": "typed answer survives a refresh",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "editor reopens on the saved step, not back at intake",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "dashboard lists the assessment after a cold load",
+    "passed": true,
+    "detail": "1 active assessment · 0 completed"
+  },
+  {
+    "name": "test run completed without throwing",
+    "passed": false,
+    "detail": "page.click: Timeout 30000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('button:has-text(\"Import 1 document\")')\u001b[22m\n"
+  }
+]

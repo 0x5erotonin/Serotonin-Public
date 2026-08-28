@@ -85,10 +85,16 @@ try {
   await page.click('button:has-text("Import 1 document")');
   await sleep(3500);
 
+  // The import screen stays put to show its batch summary, so getting back to
+  // the library is now an explicit step rather than something the import does
+  // on your behalf.
+  await page.click('button:has-text("Back to library")');
+  await sleep(1200);
+
   // A second document covering the same ground on purpose. One source is not a
   // choice, so the source picker only appears when at least two sources can
   // answer a question — this is what makes that path testable.
-  await page.click('button:has-text("Import")');
+  await page.click('button:has-text("Import"):not([disabled])');
   await page.waitForSelector('text=Access Control Policy', { timeout: 10000 });
   await page.click('button:text-is("Access Control Policy")');
   await page.setInputFiles('input[type="file"] >> nth=0', {
@@ -121,6 +127,9 @@ try {
       (chunks || []).every((c) => !!c.sourceName),
     [...new Set((chunks || []).map((c) => c.sourceName))].join(' | '),
   );
+  // Back to the library, where the index status per document is shown.
+  await page.click('button:has-text("Back to library")');
+  await sleep(1500);
   check(
     'the document is marked searchable in the library',
     (await page.locator('body').innerText()).includes('Searchable') ||

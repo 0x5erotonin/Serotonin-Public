@@ -18,6 +18,10 @@ import { uploadFile, removeFile, openFile, getFileUrl, formatBytes } from './lib
 import { isAmplifyConfigured, whenReady } from './lib/amplifyClient.js';
 import { extractText, SUPPORTED_LABEL } from './lib/extract.js';
 import { normaliseDocName } from './lib/docName.js';
+import { openZip } from './lib/unzip.js';
+import {
+  DOC_CATEGORIES, guessDocCategory, answerHistoryCsv, documentManifestCsv, exportFilename,
+} from './lib/exportFormats.js';
 import { extractQuestions, questionsFromLines } from './lib/questionExtract.js';
 import { questionsFromSheets, describeReport } from './lib/gridQuestions.js';
 import { autoReview } from './lib/matcher.js';
@@ -2230,32 +2234,70 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
   // most in exactly the state this app spends most of its life in: no backend
   // attached, so the single copy of everything is in one browser profile, one
   // "clear site data" away from gone.
-  const [backupBusy, setBackupBusy]   = useState(null); // 'export' | 'import'
-  const [backupNote, setBackupNote]   = useState(null); // { kind, message }
+  const [backupBusy, setBackupBusy] = useState(null); // which export is running
+  const [backupNote, setBackupNote] = useState(null); // { kind, message }
   const importInputRef = useRef(null);
 
-  const runExport = async () => {
-    setBackupBusy('export');
+  /** Hand a blob to the browser as a download. */
+  const download = (contents, filename, mime) => {
+    const blob = new Blob([contents], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    // Revoked on a delay: revoking immediately can cancel the download in some
+    // browsers before they have finished reading the blob.
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  };
+
+  const runExport = async (kind) => {
+    setBackupBusy(kind);
     setBackupNote(null);
     try {
+      if (kind === 'answers') {
+        const rows = kbEntries.reduce((sum, e) => sum + (e.qaData || []).length, 0);
+        if (rows === 0) {
+          setBackupNote({ kind: 'error', message: 'No answer history yet — complete a questionnaire first.' });
+          return;
+        }
+        download(answerHistoryCsv(kbEntries), exportFilename('answer-history', 'csv'), 'text/csv;charset=utf-8');
+        setBackupNote({ kind: 'done', message: `Exported ${rows} answer${rows !== 1 ? 's' : ''}.` });
+        return;
+      }
+
+      if (kind === 'documents') {
+        if (kbDocs.length === 0) {
+          setBackupNote({ kind: 'error', message: 'No documents in the library yet.' });
+          return;
+        }
+        download(
+          documentManifestCsv(kbDocs, indexedSourceIds),
+          exportFilename('documents', 'csv'),
+          'text/csv;charset=utf-8',
+        );
+        setBackupNote({ kind: 'done', message: `Exported ${kbDocs.length} document${kbDocs.length !== 1 ? 's' : ''}.` });
+        return;
+      }
+
+      // Full backup. Files are read back out of storage and inlined, which is
+      // the slow part, hence the progress messages.
       const bundle = await exportEverything({
-        onProgress: ({ stage, detail }) => setBackupNote({ kind: 'info', message: `Collecting ${stage}: ${detail}` }),
+        onProgress: ({ stage, detail, done, total }) => setBackupNote({
+          kind: 'info',
+          message: total
+            ? `Collecting ${stage}: ${detail} (${done} of ${total})`
+            : `Collecting ${stage}: ${detail}`,
+        }),
       });
-      const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = `serotonin-backup-${new Date().toISOString().slice(0, 10)}.json`;
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      // Revoked on a delay: revoking immediately can cancel the download in
-      // some browsers before it has read the blob.
-      setTimeout(() => URL.revokeObjectURL(url), 30000);
+      download(JSON.stringify(bundle, null, 2), exportFilename('backup', 'json'), 'application/json');
       const records = Object.values(bundle.collections).reduce((sum, rows) => sum + rows.length, 0);
+      const files = Object.keys(bundle.files).length;
       setBackupNote({
         kind: 'done',
-        message: `Exported ${records} record${records !== 1 ? 's' : ''} and ${Object.keys(bundle.files).length} file${Object.keys(bundle.files).length !== 1 ? 's' : ''}.`,
+        message: `Exported ${records} record${records !== 1 ? 's' : ''} and ${files} file${files !== 1 ? 's' : ''}.`,
       });
     } catch (err) {
       setBackupNote({ kind: 'error', message: `Export failed: ${err?.message || err}` });
@@ -2266,7 +2308,7 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
 
   const runImport = async (file) => {
     if (!file) return;
-    setBackupBusy('import');
+    setBackupBusy('restore');
     setBackupNote(null);
     try {
       const bundle = JSON.parse(await file.text());
@@ -2282,9 +2324,181 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
       // acting on data that is not there any more.
       setTimeout(() => window.location.reload(), 1800);
     } catch (err) {
-      setBackupNote({ kind: 'error', message: `Import failed: ${err?.message || err}` });
+      setBackupNote({ kind: 'error', message: `Restore failed: ${err?.message || err}` });
       setBackupBusy(null);
     }
+  };
+
+  /* ── Bulk import ───────────────────────────────────────────────
+   *
+   * The old importer took a list of files, applied one category to all of them,
+   * and ran them through upload → extract → index in a single loop with a
+   * boolean spinner. That works for two files and is unusable for thirty: no
+   * progress, no per-file category, and one thrown error taking the batch with
+   * it. */
+  const [dragging, setDragging]           = useState(false);
+  const [expanding, setExpanding]         = useState(null);   // archive being read
+  const [importProgress, setImportProgress] = useState(null); // { done, total, current }
+  const [importSummary, setImportSummary] = useState(null);
+
+  const queuedCount = importedFiles.filter(row => row.status === 'queued').length;
+
+  const queueRow = (file, { fromArchive = false } = {}) => ({
+    file,
+    name: file.name,
+    size: file.size,
+    // Guessed per file, and editable in the list. Guessing beats forcing one
+    // category on a mixed batch, and beats making somebody set thirty by hand.
+    category: docCategory || guessDocCategory(file.name),
+    fromArchive,
+    status: 'queued',
+    message: '',
+  });
+
+  /**
+   * Add files, expanding any archive into the documents inside it.
+   *
+   * Reuses the same zero-dependency ZIP reader the .xlsx parser is built on, so
+   * this costs no new dependency. Entries that are not documents — directories,
+   * macOS resource forks, anything with an extension the extractor cannot read —
+   * are skipped rather than queued to fail later.
+   */
+  const addFilesToQueue = async (files) => {
+    if (files.length === 0) return;
+    const archives = files.filter(f => /\.zip$/i.test(f.name));
+    const plain = files.filter(f => !/\.zip$/i.test(f.name));
+
+    setImportSummary(null);
+    if (plain.length > 0) setImportedFiles(prev => [...prev, ...plain.map(f => queueRow(f))]);
+
+    for (const archive of archives) {
+      setExpanding(archive.name);
+      try {
+        const zip = openZip(new Uint8Array(await archive.arrayBuffer()));
+        const wanted = zip.names.filter(name => (
+          !name.endsWith('/') &&
+          !name.startsWith('__MACOSX') &&
+          !name.split('/').pop().startsWith('.') &&
+          /\.(pdf|docx|xlsx|xlsm|csv|tsv|txt|md)$/i.test(name)
+        ));
+        if (wanted.length === 0) {
+          setImportError(`${archive.name} contains no importable documents. PDF, DOCX, XLSX, CSV, TXT and MD are read; other entries are skipped.`);
+          continue;
+        }
+        const extracted = [];
+        for (const name of wanted) {
+          try {
+            const bytes = await zip.read(name);
+            const leaf = name.split('/').pop();
+            extracted.push(queueRow(new File([bytes], leaf, { type: '' }), { fromArchive: true }));
+          } catch (err) {
+            // One bad entry must not lose the rest of the archive.
+            extracted.push({
+              file: null, name: name.split('/').pop(), size: 0,
+              category: 'Other', fromArchive: true,
+              status: 'failed', message: String(err?.message || err),
+            });
+          }
+        }
+        setImportedFiles(prev => [...prev, ...extracted]);
+      } catch (err) {
+        setImportError(`Could not read ${archive.name}: ${err?.message || err}`);
+      } finally {
+        setExpanding(null);
+      }
+    }
+  };
+
+  const runBulkImport = async () => {
+    const queue = importedFiles
+      .map((row, index) => ({ row, index }))
+      .filter(({ row }) => row.status === 'queued' && row.file);
+    if (queue.length === 0) return;
+
+    setImporting(true);
+    setImportError('');
+    setImportSummary(null);
+    setImportProgress({ done: 0, total: queue.length, current: '' });
+
+    const problems = [];
+    const indexJobs = [];
+    let imported = 0;
+    let failed = 0;
+    let done = 0;
+
+    const setRow = (index, patch) =>
+      setImportedFiles(prev => prev.map((r, j) => (j === index ? { ...r, ...patch } : r)));
+
+    // Sequential on purpose. Each file is an upload plus a text extraction plus
+    // an embedding call per passage; running six at once turns a slow import
+    // into a slow import that also fights itself for bandwidth and rate limit.
+    for (const { row, index } of queue) {
+      setImportProgress({ done, total: queue.length, current: row.name });
+      setRow(index, { status: 'working', message: '' });
+
+      try {
+        const stored = await uploadFile(row.file, { folder: 'kb-documents' });
+        if (stored.error) {
+          problems.push(`${row.name}: the file itself could not be stored (${stored.error}) — the record is in your library, re-import to retry.`);
+        }
+
+        // Extract while the file is in hand, so indexing needs no second read.
+        let extracted = null;
+        try {
+          extracted = await extractText(row.file);
+          if (extracted.error) {
+            problems.push(`${row.name}: stored, but not searchable — ${extracted.error}`);
+            extracted = null;
+          }
+        } catch (err) {
+          problems.push(`${row.name}: stored, but not searchable — ${err?.message || err}`);
+          extracted = null;
+        }
+
+        const job = onAddDoc && onAddDoc({
+          id:          `doc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          name:        stored.name || row.name,
+          category:    row.category || 'Other',
+          note:        docNote,
+          size:        formatBytes(stored.sizeBytes),
+          sizeBytes:   stored.sizeBytes,
+          contentType: stored.contentType,
+          storagePath: stored.storagePath,
+          date:        new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
+          source:      row.fromArchive ? 'Imported from archive' : 'Imported',
+          tags:        [row.category || 'Other'],
+          savedAt:     new Date().toISOString(),
+        }, extracted);
+        if (job?.then) indexJobs.push(job);
+
+        imported += 1;
+        setRow(index, { status: 'done', message: stored.error ? 'record saved, file not stored' : '' });
+      } catch (err) {
+        // A single file failing must not end the batch — that is the whole point
+        // of a bulk import.
+        failed += 1;
+        problems.push(`${row.name}: ${err?.message || err}`);
+        setRow(index, { status: 'failed', message: String(err?.message || err) });
+      }
+
+      done += 1;
+      setImportProgress({ done, total: queue.length, current: row.name });
+    }
+
+    // Wait for indexing before reporting, so the library does not say
+    // "Not indexed" for a document it is in the middle of indexing.
+    setImportProgress({ done, total: queue.length, current: 'Indexing for auto-review' });
+    let indexed = 0;
+    for (const outcome of await Promise.all(indexJobs)) {
+      if (outcome?.warning) problems.push(outcome.warning);
+      if (outcome?.chunks > 0) indexed += 1;
+    }
+
+    setImporting(false);
+    setImportProgress(null);
+    setImportSummary({ total: queue.length, imported, failed, indexed, problems });
+    setDocNote('');
+    refreshIndex();
   };
 
   // ── Auto-review index coverage ─────────────────────────────────
@@ -2413,6 +2627,22 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
 
   return (
     <div style={{ maxWidth: 900, margin: '0 auto' }}>
+      {/*
+        One hidden input for restoring a backup, shared by the storage panel and
+        the export screen — and rendered only where one of those is on screen.
+        Left mounted permanently it became the first file input in the document,
+        which is a trap for anything selecting inputs positionally: the import
+        screen's own picker stopped being the obvious one to reach for.
+      */}
+      {(showStorage || view === 'export') && (
+        <input
+          ref={importInputRef}
+          type="file"
+          accept="application/json,.json"
+          onChange={e => { const f = e.target.files?.[0]; e.target.value = ''; runImport(f); }}
+          style={{ display: 'none' }}
+        />
+      )}
       {showStorage && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 24 }}>
           <div style={{ background: t.bg, border: `0.5px solid ${t.border}`, borderRadius: 12, maxWidth: 560, width: '100%', padding: 28 }}>
@@ -2456,26 +2686,18 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
               </div>
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 <button
-                  onClick={runExport}
+                  onClick={() => runExport('backup')}
                   disabled={!!backupBusy}
                   style={{ ...s.accentBtn, fontSize: 11, padding: '6px 14px', display: 'inline-flex', alignItems: 'center', gap: 6, opacity: backupBusy ? 0.5 : 1 }}
                 >
-                  <Download size={12} />{backupBusy === 'export' ? 'Exporting…' : 'Export everything'}
+                  <Download size={12} />{backupBusy === 'backup' ? 'Exporting…' : 'Export everything'}
                 </button>
                 <button
-                  onClick={() => importInputRef.current?.click()}
-                  disabled={!!backupBusy}
-                  style={{ ...s.ghostBtn, fontSize: 11, padding: '6px 14px', display: 'inline-flex', alignItems: 'center', gap: 6, opacity: backupBusy ? 0.5 : 1 }}
+                  onClick={() => { setShowStorage(false); setBackupNote(null); setView('export'); }}
+                  style={{ ...s.ghostBtn, fontSize: 11, padding: '6px 14px', display: 'inline-flex', alignItems: 'center', gap: 6 }}
                 >
-                  <Upload size={12} />{backupBusy === 'import' ? 'Restoring…' : 'Restore a backup'}
+                  <ExternalLink size={12} />More export options
                 </button>
-                <input
-                  ref={importInputRef}
-                  type="file"
-                  accept="application/json,.json"
-                  onChange={e => { const f = e.target.files?.[0]; e.target.value = ''; runImport(f); }}
-                  style={{ display: 'none' }}
-                />
               </div>
               {backupNote && (
                 <div style={{ fontFamily: t.sansFont, fontSize: 11, marginTop: 9, color: backupNote.kind === 'error' ? t.dangerText : backupNote.kind === 'done' ? t.done : t.text3 }}>
@@ -2500,6 +2722,7 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
             </div>
             <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
               <button onClick={() => setShowStorage(true)} style={{ ...s.ghostBtn, display: 'flex', alignItems: 'center', gap: 6 }}><Database size={13} />Storage info</button>
+              <button onClick={() => { setBackupNote(null); setView('export'); }} style={{ ...s.ghostBtn, display: 'flex', alignItems: 'center', gap: 6 }}><Download size={13} />Export</button>
               <button onClick={() => setView('import')} style={{ ...s.accentBtn, display: 'flex', alignItems: 'center', gap: 6 }}><Plus size={13} />Import</button>
             </div>
           </div>
@@ -2931,31 +3154,29 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
           <div style={{ ...s.heroSerif, fontSize: 26, marginBottom: 6 }}>
             Add security documents<br /><em style={{ color: t.heroMuted }}>to your library.</em>
           </div>
-          <div style={{ fontFamily: t.sansFont, fontSize: 13, color: t.text3, marginBottom: 28, lineHeight: 1.6 }}>
-            Import access control policies, disaster recovery plans, SOC 2 reports, BCP docs, and any other security reference material. These will be available to reference when completing questionnaires.
+          <div style={{ fontFamily: t.sansFont, fontSize: 13, color: t.text3, marginBottom: 24, lineHeight: 1.6 }}>
+            Drop a whole folder's worth at once, or a .zip of them. Each file gets a
+            category guessed from its name — check them, correct any that are wrong,
+            and import. A file that fails is reported and skipped; the rest still go in.
           </div>
 
-          {/* Category selector */}
+          {/* Default category for files added from here on. Per-file categories
+              are editable in the list below, which is what makes a mixed batch
+              workable — one category for thirty documents is not a bulk import. */}
           <div style={{ marginBottom: 16 }}>
-            <div style={{ ...s.label, marginBottom: 8 }}>Document category</div>
+            <div style={{ ...s.label, marginBottom: 8 }}>Default category for new files</div>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 8 }}>
-              {[
-                'Access Control Policy',
-                'Disaster Recovery Plan',
-                'Business Continuity Plan',
-                'SOC 2 Report',
-                'Information Security Policy',
-                'Incident Response Plan',
-                'Data Classification Policy',
-                'Vendor Management Policy',
-                'Risk Assessment',
-                'Penetration Test Report',
-                'Business Associate Agreement',
-                'Other',
-              ].map(cat => (
+              {DOC_CATEGORIES.map(cat => (
                 <button
                   key={cat}
-                  onClick={() => setDocCategory(cat)}
+                  onClick={() => {
+                    setDocCategory(cat);
+                    // Retro-apply to anything not yet imported, so picking a
+                    // category after selecting files does what it looks like.
+                    setImportedFiles(prev => prev.map(row => (
+                      row.status === 'queued' ? { ...row, category: cat } : row
+                    )));
+                  }}
                   style={{
                     padding: '8px 12px', borderRadius: 6, textAlign: 'left',
                     border: `0.5px solid ${docCategory === cat ? t.accent : t.border}`,
@@ -2969,173 +3190,275 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
                 </button>
               ))}
             </div>
+            <div style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3, marginTop: 6 }}>
+              Optional — each file is guessed from its filename. This only overrides files that are still queued.
+            </div>
           </div>
 
           {/* Notes field */}
           <div style={{ marginBottom: 20 }}>
-            <div style={{ ...s.label, marginBottom: 6 }}>Notes (optional)</div>
+            <div style={{ ...s.label, marginBottom: 6 }}>Notes applied to every file (optional)</div>
             <input
               value={docNote}
               onChange={e => setDocNote(e.target.value)}
-              placeholder="e.g. Last reviewed Q1 2025 · Version 3.2 · Approved by CISO"
+              placeholder="e.g. Last reviewed Q1 2026 · Version 3.2 · Approved by CISO"
               style={s.input}
             />
           </div>
 
-          {/* File drop zone */}
-          <label style={{ display: 'block', cursor: 'pointer', marginBottom: 16 }}>
+          {/* Drop zone — click or drag. */}
+          <label
+            onDragOver={e => { e.preventDefault(); setDragging(true); }}
+            onDragEnter={e => { e.preventDefault(); setDragging(true); }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={e => {
+              e.preventDefault();
+              setDragging(false);
+              addFilesToQueue(Array.from(e.dataTransfer?.files || []));
+            }}
+            style={{ display: 'block', cursor: 'pointer', marginBottom: 16 }}
+          >
             <input
               type="file"
               multiple
-              accept=".pdf,.docx,.xlsx,.xlsm,.csv,.tsv,.txt,.md,.doc,.xls,.pptx"
+              accept=".pdf,.docx,.xlsx,.xlsm,.csv,.tsv,.txt,.md,.doc,.xls,.pptx,.zip"
               style={{ display: 'none' }}
-              onChange={e => {
-                const files = Array.from(e.target.files);
-                setImportedFiles(prev => [
-                  ...prev,
-                  ...files.map(f => ({ name: f.name, size: f.size, file: f }))
-                ]);
-                e.target.value = '';
-              }}
+              onChange={e => { addFilesToQueue(Array.from(e.target.files || [])); e.target.value = ''; }}
             />
             <div style={{
-              border: `1.5px dashed ${importedFiles.length > 0 ? t.accent : t.border}`,
+              border: `1.5px dashed ${dragging ? t.accent : importedFiles.length > 0 ? t.accent : t.border}`,
               borderRadius: 10, padding: '32px 24px', textAlign: 'center',
-              background: importedFiles.length > 0 ? t.accentBg : 'transparent',
+              background: dragging || importedFiles.length > 0 ? t.accentBg : 'transparent',
               transition: 'all .2s',
             }}>
-              <Upload size={28} color={importedFiles.length > 0 ? t.accent : t.text3} style={{ margin: '0 auto 12px' }} />
-              <div style={{ fontFamily: t.sansFont, fontSize: 14, fontWeight: 600, color: importedFiles.length > 0 ? t.accent : t.text2, marginBottom: 4 }}>
-                {importedFiles.length > 0 ? `${importedFiles.length} file${importedFiles.length !== 1 ? 's' : ''} selected` : 'Click to select files'}
+              <Upload size={28} color={dragging || importedFiles.length > 0 ? t.accent : t.text3} style={{ margin: '0 auto 12px' }} />
+              <div style={{ fontFamily: t.sansFont, fontSize: 14, fontWeight: 600, color: dragging || importedFiles.length > 0 ? t.accent : t.text2, marginBottom: 4 }}>
+                {dragging
+                  ? 'Drop them here'
+                  : importedFiles.length > 0
+                    ? `${importedFiles.length} file${importedFiles.length !== 1 ? 's' : ''} queued`
+                    : 'Drag files here, or click to select'}
               </div>
               <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3 }}>
-                PDF, DOCX, DOC, XLSX, PPTX, TXT, CSV
+                PDF, DOCX, XLSX, CSV, TXT, MD — or a .zip containing them
               </div>
             </div>
           </label>
 
-          {/* Selected files list */}
-          {importedFiles.length > 0 && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 20 }}>
-              {importedFiles.map((f, i) => (
-                <div key={i} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: t.bg2, border: `0.5px solid ${t.border}`, borderRadius: 6 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <FileText size={13} color={t.accent} />
-                    <div>
-                      <div style={{ fontFamily: t.sansFont, fontSize: 12, color: t.text, fontWeight: 500 }}>{f.name}</div>
-                      <div style={{ fontFamily: t.sansFont, fontSize: 10, color: t.text3 }}>
-                        {f.size < 1024 ? f.size + ' B' : f.size < 1048576 ? (f.size/1024).toFixed(1) + ' KB' : (f.size/1048576).toFixed(1) + ' MB'}
-                      </div>
-                    </div>
-                  </div>
-                  <button onClick={() => setImportedFiles(prev => prev.filter((_, j) => j !== i))} style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.text3, display: 'flex', padding: 4 }}>
-                    <X size={13} />
-                  </button>
-                </div>
-              ))}
+          {expanding && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', background: t.accentBg, border: `0.5px solid ${t.accent}`, borderRadius: 7, marginBottom: 12 }}>
+              <Activity size={13} color={t.accent} />
+              <span style={{ fontFamily: t.sansFont, fontSize: 12, color: t.accentText }}>Reading archive — {expanding}</span>
             </div>
           )}
 
-          {/* Validation hint */}
-          {!docCategory && importedFiles.length > 0 && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', background: t.warnBg, border: `0.5px solid ${t.warn}`, borderRadius: 7, marginBottom: 16 }}>
-              <AlertTriangle size={14} color={t.warn} />
-              <span style={{ fontFamily: t.sansFont, fontSize: 12, color: t.warnText }}>Please select a document category above before importing.</span>
+          {/* The queue. Every row keeps its own category and its own outcome, so a
+              failure names the file it belongs to instead of the batch. */}
+          {importedFiles.length > 0 && (
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                <div style={s.label}>Queue ({importedFiles.length})</div>
+                {!importing && (
+                  <button
+                    onClick={() => setImportedFiles([])}
+                    style={{ background: 'none', border: 'none', cursor: 'pointer', fontFamily: t.sansFont, fontSize: 11, color: t.text3 }}
+                  >
+                    Clear all
+                  </button>
+                )}
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 360, overflowY: 'auto' }}>
+                {importedFiles.map((row, i) => (
+                  <div
+                    key={`${row.name}-${i}`}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px',
+                      background: t.bg2, borderRadius: 6,
+                      border: `0.5px solid ${row.status === 'failed' ? t.danger : row.status === 'done' ? t.done : row.status === 'working' ? t.accent : t.border}`,
+                    }}
+                  >
+                    <FileText size={13} color={row.status === 'failed' ? t.danger : t.accent} style={{ flexShrink: 0 }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontFamily: t.sansFont, fontSize: 12, color: t.text, fontWeight: 500, overflowWrap: 'anywhere' }}>
+                        {row.name}
+                        {row.fromArchive && <span style={{ ...s.pill(t.bg3, t.text3), marginLeft: 6 }}>from zip</span>}
+                      </div>
+                      <div style={{ fontFamily: t.sansFont, fontSize: 10, color: row.status === 'failed' ? t.dangerText : t.text3, marginTop: 2 }}>
+                        {formatBytes(row.size)}
+                        {row.message ? ` · ${row.message}` : ''}
+                      </div>
+                    </div>
+                    <select
+                      value={row.category}
+                      disabled={importing || row.status === 'done'}
+                      onChange={e => setImportedFiles(prev => prev.map((r, j) => (j === i ? { ...r, category: e.target.value } : r)))}
+                      aria-label={`Category for ${row.name}`}
+                      style={{
+                        flexShrink: 0, background: t.bg, color: t.text2,
+                        border: `0.5px solid ${t.border}`, borderRadius: 5,
+                        fontFamily: t.sansFont, fontSize: 10, padding: '4px 6px', maxWidth: 190,
+                      }}
+                    >
+                      {DOC_CATEGORIES.map(cat => <option key={cat} value={cat}>{cat}</option>)}
+                    </select>
+                    <span style={{ flexShrink: 0, width: 74, textAlign: 'right' }}>
+                      {row.status === 'queued'  && <span style={s.pill(t.bg3, t.text3)}>Queued</span>}
+                      {row.status === 'working' && <span style={s.pill(t.accentBg, t.accentText)}>Working</span>}
+                      {row.status === 'done'    && <span style={s.pill(t.doneBg, t.done)}>Imported</span>}
+                      {row.status === 'failed'  && <span style={s.pill(t.dangerBg, t.dangerText)}>Failed</span>}
+                    </span>
+                    {!importing && row.status !== 'done' && (
+                      <button
+                        onClick={() => setImportedFiles(prev => prev.filter((_, j) => j !== i))}
+                        style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.text3, display: 'flex', padding: 2, flexShrink: 0 }}
+                        aria-label={`Remove ${row.name}`}
+                      >
+                        <X size={13} />
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Progress across the batch. A thirty-file import with a spinner and no
+              count is indistinguishable from one that has hung. */}
+          {importing && importProgress && (
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                <span style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text2 }}>
+                  {importProgress.current || 'Working'}
+                </span>
+                <span style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3 }}>
+                  {importProgress.done} of {importProgress.total}
+                </span>
+              </div>
+              <div style={{ height: 4, background: t.border, borderRadius: 2 }}>
+                <div style={{ height: '100%', width: `${Math.round((importProgress.done / Math.max(1, importProgress.total)) * 100)}%`, background: t.accent, borderRadius: 2, transition: 'width .3s' }} />
+              </div>
+            </div>
+          )}
+
+          {importSummary && (
+            <div style={{ background: importSummary.failed > 0 ? t.warnBg : t.doneBg, border: `0.5px solid ${importSummary.failed > 0 ? t.warn : t.done}`, borderRadius: 7, padding: '12px 14px', marginBottom: 16 }}>
+              <div style={{ fontFamily: t.sansFont, fontSize: 12, fontWeight: 600, color: importSummary.failed > 0 ? t.warnText : t.done, marginBottom: importSummary.problems.length ? 6 : 0 }}>
+                Imported {importSummary.imported} of {importSummary.total}
+                {importSummary.failed > 0 ? ` — ${importSummary.failed} failed` : ''}
+                {importSummary.indexed > 0 ? ` · ${importSummary.indexed} searchable` : ''}
+              </div>
+              {importSummary.problems.slice(0, 6).map((problem, i) => (
+                <div key={i} style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3, marginTop: 3, lineHeight: 1.5 }}>• {problem}</div>
+              ))}
             </div>
           )}
 
           {/* Actions */}
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingTop: 16, borderTop: `0.5px solid ${t.border}` }}>
-            <button onClick={() => { setView('library'); setImportedFiles([]); setDocCategory(''); setDocNote(''); }} style={{ ...s.ghostBtn, display: 'flex', alignItems: 'center', gap: 6 }}>
-              <ArrowLeft size={13} />Cancel
+            <button
+              onClick={() => { setView('library'); setImportedFiles([]); setDocCategory(''); setDocNote(''); setImportSummary(null); }}
+              disabled={importing}
+              style={{ ...s.ghostBtn, display: 'flex', alignItems: 'center', gap: 6, opacity: importing ? 0.5 : 1 }}
+            >
+              <ArrowLeft size={13} />{importSummary ? 'Back to library' : 'Cancel'}
             </button>
             <button
-              disabled={importedFiles.length === 0 || !docCategory || importing}
-              onClick={async () => {
-                if (!docCategory || importedFiles.length === 0) return;
-                setImporting(true);
-                setImportError('');
-                // Upload each file for real, then save its record. The old
-                // version faked an 800ms delay and dropped the bytes on the
-                // floor — the metadata persisted, the document did not.
-                const failed = [];
-                const unreadable = [];
-                const indexJobs = [];
-                for (const f of importedFiles) {
-                  const stored = await uploadFile(f.file, { folder: 'kb-documents' });
-                  if (stored.error) failed.push(stored.name);
-
-                  // Extract the text now, while the file is in hand, so it can
-                  // be indexed for auto-review without a second download.
-                  let extracted = null;
-                  try {
-                    extracted = await extractText(f.file);
-                    if (extracted.error) {
-                      unreadable.push(`${stored.name}: ${extracted.error}`);
-                      extracted = null;
-                    }
-                  } catch (err) {
-                    unreadable.push(`${stored.name}: ${err?.message || err}`);
-                    extracted = null;
-                  }
-
-                  const job = onAddDoc && onAddDoc({
-                    id:          `doc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-                    name:        stored.name,
-                    category:    docCategory,
-                    note:        docNote,
-                    size:        formatBytes(stored.sizeBytes),
-                    sizeBytes:   stored.sizeBytes,
-                    contentType: stored.contentType,
-                    storagePath: stored.storagePath,
-                    date:        new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
-                    source:      'Imported',
-                    tags:        [docCategory],
-                    savedAt:     new Date().toISOString(),
-                  }, extracted);
-                  if (job?.then) indexJobs.push(job);
-                }
-
-                // Wait for indexing before reporting status, so the library does
-                // not show "Not indexed" for a document it is still indexing.
-                const outcomes = await Promise.all(indexJobs);
-                for (const outcome of outcomes) {
-                  if (outcome?.warning) unreadable.push(outcome.warning);
-                }
-                setImporting(false);
-                setImportedFiles([]);
-                setDocCategory('');
-                setDocNote('');
-                setActiveFilter('documents');
-                setView('library');
-                const problems = [];
-                if (failed.length > 0) {
-                  problems.push(
-                    `The file itself could not be stored for: ${failed.join(', ')}. ` +
-                    'The record is in your library — re-import to retry the upload.',
-                  );
-                }
-                if (unreadable.length > 0) {
-                  // Stored but not indexed: it will not turn up in auto-review.
-                  problems.push(
-                    `Stored, but not searchable by auto-review — ${unreadable.join('; ')}`,
-                  );
-                }
-                if (problems.length > 0) setImportError(problems.join(' '));
-                refreshIndex();
-              }}
+              disabled={queuedCount === 0 || importing}
+              onClick={runBulkImport}
               style={{
                 ...s.accentBtn,
                 display: 'flex', alignItems: 'center', gap: 6,
-                opacity: (importedFiles.length === 0 || !docCategory || importing) ? 0.5 : 1,
-                cursor: (importedFiles.length === 0 || !docCategory || importing) ? 'not-allowed' : 'pointer',
+                opacity: (queuedCount === 0 || importing) ? 0.5 : 1,
+                cursor: (queuedCount === 0 || importing) ? 'not-allowed' : 'pointer',
               }}
             >
-              {importing ? (
-                <><Activity size={13} />Importing…</>
-              ) : (
-                <><CheckCircle size={13} />Import {importedFiles.length > 0 ? `${importedFiles.length} document${importedFiles.length !== 1 ? 's' : ''}` : 'documents'}</>
-              )}
+              {importing
+                ? <><Activity size={13} />Importing…</>
+                : <><CheckCircle size={13} />Import {queuedCount > 0 ? `${queuedCount} document${queuedCount !== 1 ? 's' : ''}` : 'documents'}</>}
+            </button>
+          </div>
+        </>
+      )}
+
+      {view === 'export' && (
+        <>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <button onClick={() => setView('library')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.text3, display: 'flex', padding: 2 }}><ArrowLeft size={16} /></button>
+            <div style={{ ...s.eyebrow }}>Export</div>
+          </div>
+          <div style={{ ...s.heroSerif, fontSize: 26, marginBottom: 6 }}>
+            Take your library<br /><em style={{ color: t.heroMuted }}>with you.</em>
+          </div>
+          <div style={{ fontFamily: t.sansFont, fontSize: 13, color: t.text3, marginBottom: 26, lineHeight: 1.6 }}>
+            {amplifyOn
+              ? 'A full backup restores into another deployment. The spreadsheets are for reading, reviewing and sharing — they do not restore.'
+              : 'Your library exists in this browser and nowhere else. Clearing site data, switching browsers, or moving to a different domain leaves it behind. Export before any of those.'}
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {[
+              {
+                id: 'backup',
+                title: 'Full backup (JSON)',
+                detail: 'Every record and every stored file, inline. This is the one that can be restored.',
+                stat: `${kbEntries.length + kbDocs.length} item${kbEntries.length + kbDocs.length !== 1 ? 's' : ''} + files`,
+                primary: true,
+              },
+              {
+                id: 'answers',
+                title: 'Answer history (CSV)',
+                detail: 'Every question and answer from every completed questionnaire, one row each. Openable in Excel.',
+                stat: `${kbEntries.reduce((sum, e) => sum + (e.qaData || []).length, 0)} answer${kbEntries.reduce((sum, e) => sum + (e.qaData || []).length, 0) !== 1 ? 's' : ''}`,
+              },
+              {
+                id: 'documents',
+                title: 'Document manifest (CSV)',
+                detail: 'What is in the library, its category and date, and whether auto-review can actually see it.',
+                stat: `${kbDocs.length} document${kbDocs.length !== 1 ? 's' : ''}`,
+              },
+            ].map(option => (
+              <div key={option.id} style={{ ...s.card, padding: '16px 18px', display: 'flex', alignItems: 'center', gap: 14 }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                    <div style={{ fontFamily: t.sansFont, fontSize: 13, fontWeight: 600, color: t.text }}>{option.title}</div>
+                    <span style={s.pill(t.bg2, t.text3)}>{option.stat}</span>
+                  </div>
+                  <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3, lineHeight: 1.5 }}>{option.detail}</div>
+                </div>
+                <button
+                  onClick={() => runExport(option.id)}
+                  disabled={!!backupBusy}
+                  aria-label={`Download ${option.title}`}
+                  style={{
+                    ...(option.primary ? s.accentBtn : s.ghostBtn),
+                    fontSize: 11, padding: '7px 14px', flexShrink: 0,
+                    display: 'inline-flex', alignItems: 'center', gap: 6,
+                    opacity: backupBusy ? 0.5 : 1,
+                  }}
+                >
+                  <Download size={12} />{backupBusy === option.id ? 'Working…' : 'Download'}
+                </button>
+              </div>
+            ))}
+          </div>
+
+          {backupNote && (
+            <div style={{ fontFamily: t.sansFont, fontSize: 12, marginTop: 14, color: backupNote.kind === 'error' ? t.dangerText : backupNote.kind === 'done' ? t.done : t.text3 }}>
+              {backupNote.message}
+            </div>
+          )}
+
+          <div style={{ marginTop: 26, paddingTop: 18, borderTop: `0.5px solid ${t.border}` }}>
+            <div style={{ ...s.label, marginBottom: 6 }}>Restore a backup</div>
+            <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3, lineHeight: 1.5, marginBottom: 10 }}>
+              Additive: a record already here is skipped, not replaced, so restoring an older backup cannot roll the library back. Only the JSON backup can be restored — a CSV is for reading.
+            </div>
+            <button
+              onClick={() => importInputRef.current?.click()}
+              disabled={!!backupBusy}
+              style={{ ...s.ghostBtn, fontSize: 11, padding: '7px 14px', display: 'inline-flex', alignItems: 'center', gap: 6, opacity: backupBusy ? 0.5 : 1 }}
+            >
+              <Upload size={12} />{backupBusy === 'restore' ? 'Restoring…' : 'Choose a backup file'}
             </button>
           </div>
         </>
@@ -3362,6 +3685,13 @@ Renaming changes the label only. The stored file keeps its original storage key,
 **Deleting an entry**
 Click the × button on any card. A confirmation modal will ask you to confirm before permanently deleting — this cannot be undone.
 
+**Importing documents in bulk**
+Knowledge base → Import. Drag a folder's worth of files onto the drop zone, click to select several, or drop a **.zip** and it is expanded for you — directories, dotfiles, macOS resource forks and anything that is not a readable document are skipped rather than queued to fail.
+
+Each file gets a category guessed from its filename ("soc2-type-ii-2026.pdf" → SOC 2 Report), shown in the queue and editable per row before you import. The default-category buttons at the top apply to files that are still queued, so picking one after selecting files does what it looks like.
+
+During the import you get a progress bar and a per-file status: Queued, Working, Imported, Failed. A file that fails is named, the reason is given, and the rest of the batch still imports — which is the point of a bulk import. The summary at the end says how many went in, how many are searchable by auto-review, and what went wrong with anything that did not.
+
 **Importing documents**
 Click Import to add policy documents, SOC 2 reports, disaster recovery plans, and other security reference material. Select a category, add optional notes, then upload one or more files.`,
       },
@@ -3542,8 +3872,14 @@ If the app shows "Serotonin…" and doesn't load after 5 seconds, try a hard ref
 **I can't see documents I uploaded**
 Uploaded policy documents are listed under both Knowledge base → All entries and Knowledge base → Policy documents. If neither shows them, check whether a search term or tag filter is still applied — the count in the tab label tells you how many exist regardless of the filter.
 
-**How do I back up my library?**
-Knowledge base → Storage info → Export everything. You get one JSON file containing every record and every uploaded file. Restore it from the same panel. Worth doing before any change to where data lives — a new domain, a backend going live, or clearing your browser.
+**How do I back up my library, or get data out?**
+Knowledge base → Export. Three options:
+
+- **Full backup (JSON)** — every record and every stored file, inline. The only one that can be restored.
+- **Answer history (CSV)** — every question and answer from every completed questionnaire, one row each. Opens in Excel; useful for review, bulk editing, or handing to someone without the app.
+- **Document manifest (CSV)** — what is in the library, its category and date, and whether auto-review can actually see it.
+
+Restore is on the same screen and is additive: a record already present is skipped, never replaced, so restoring an older backup cannot roll the library back. Worth exporting before any change to where data lives — a new domain, a backend going live, or clearing your browser.
 
 With no backend attached your library exists in this browser and nowhere else. Clearing site data, switching browsers, or moving the app to a different domain all leave it behind.
 
