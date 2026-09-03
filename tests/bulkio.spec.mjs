@@ -279,7 +279,58 @@ try {
     );
   }
 
-  /* ── 5. Answer history export refuses honestly when empty ──────────────── */
+  /* ── 5. The integration export, validated against its published schema ─── */
+  const apiDownload = page.waitForEvent('download', { timeout: 60000 }).catch(() => null);
+  await page.click('button[aria-label="Download Integration export (JSON)"]');
+  const apiFile = await apiDownload;
+  check('the integration export downloads', !!apiFile, apiFile ? await apiFile.suggestedFilename() : 'no download');
+  if (apiFile) {
+    const api = JSON.parse(await readDownload(apiFile));
+    check('it identifies itself as the API format, not the backup', api.format === 'serotonin.api', api.format);
+    check('it is versioned', /^1\.\d+\.\d+$/.test(api.version || ''), api.version);
+    check(
+      'the documents imported through the UI are in it',
+      (api.documents || []).length === afterMixed.length,
+      `${(api.documents || []).length} of ${afterMixed.length}`,
+    );
+    check(
+      'each document reports whether auto-review can see it',
+      (api.documents || []).every(d => typeof d.indexed === 'boolean') &&
+        api.documents.some(d => d.indexed),
+      `${api.counts?.indexedDocuments} indexed`,
+    );
+    check(
+      'the parsed passages are included, so no consumer re-parses a PDF',
+      (api.passages || []).length > 0 && api.passages.every(p => typeof p.text === 'string' && p.text.length > 0),
+      `${(api.passages || []).length} passage(s)`,
+    );
+    check(
+      'files are references rather than inlined bytes',
+      (api.documents || []).every(d => d.file && d.file.bytesIncluded === false) &&
+        !JSON.stringify(api).includes('base64'),
+    );
+    check(
+      'the ambiguous "questions" field does not appear anywhere',
+      !JSON.stringify(api).includes('"questions"'),
+    );
+    check(
+      'counts match the collections they describe',
+      api.counts.documents === api.documents.length && api.counts.passages === api.passages.length,
+      `documents ${api.counts.documents}/${api.documents.length}, passages ${api.counts.passages}/${api.passages.length}`,
+    );
+    // The real check: the file a user actually downloads satisfies the published
+    // contract. Fixtures are validated in tests/apiexport.spec.mjs; this is the
+    // same validation against output that came out of the running app.
+    const { validateApiExport } = await import('./apiSchemaCheck.mjs');
+    const schemaErrors = validateApiExport(api);
+    check(
+      'the downloaded file validates against docs/serotonin.api.v1.schema.json',
+      schemaErrors.length === 0,
+      schemaErrors.slice(0, 4).join(' | '),
+    );
+  }
+
+  /* ── 6. Answer history export refuses honestly when empty ──────────────── */
   const emptyAnswers = page.waitForEvent('download', { timeout: 4000 }).catch(() => null);
   await page.click('button[aria-label="Download Answer history (CSV)"]');
   await sleep(1200);

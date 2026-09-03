@@ -12,10 +12,11 @@
     "sandbox": "ampx sandbox",
     "sandbox:delete": "ampx sandbox delete",
     "test": "npm run test:unit",
-    "test:unit": "node tests/extraction.spec.mjs && node tests/matching.spec.mjs && node tests/xlsx.spec.mjs && node tests/rename.spec.mjs && node tests/chunking.spec.mjs && node tests/exportformats.spec.mjs",
+    "test:unit": "node tests/extraction.spec.mjs && node tests/matching.spec.mjs && node tests/xlsx.spec.mjs && node tests/rename.spec.mjs && node tests/chunking.spec.mjs && node tests/exportformats.spec.mjs && node tests/apiexport.spec.mjs && node tests/librarymode.spec.mjs",
     "test:browser": "node tests/persistence.spec.mjs && node tests/autoreview.spec.mjs && node tests/ownership.spec.mjs && node tests/liveindex.spec.mjs && node tests/bulkio.spec.mjs",
     "fixtures": "node tests/fixtures/make-xlsx.mjs && node tests/fixtures/make-zip.mjs",
-    "test:migration": "node tests/migration.spec.mjs"
+    "test:migration": "node tests/migration.spec.mjs",
+    "test:shared": "node tests/sharedlibrary.spec.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.43.0",

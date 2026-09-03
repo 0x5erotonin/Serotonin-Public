@@ -28,6 +28,15 @@ export const storage = defineStorage({
     'user-files/{entity_id}/*': [
       allow.entity('identity').to(['read', 'write', 'delete']),
     ],
+    /**
+     * Shared library mode (VITE_SHARED_LIBRARY=1). One prefix, readable and
+     * writable by everyone who can reach the app — which is the point, and the
+     * risk. See src/lib/libraryMode.js before enabling it.
+     */
+    'shared-files/*': [
+      allow.guest().to(['read', 'write', 'delete']),
+      allow.authenticated().to(['read', 'write', 'delete']),
+    ],
     'guest-files/*': [
       allow.guest().to(['read', 'write', 'delete']),
       allow.authenticated().to(['read', 'write', 'delete']),

@@ -1,0 +1,219 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/0x5erotonin/Serotonin-public/blob/main/docs/serotonin.api.v1.schema.json",
+  "title": "Serotonin integration export, version 1",
+  "description": "The shape to point an integration at. Distinct from serotonin.backup, which exists to be restored and mirrors the app's internal state. Every field name here means one thing everywhere: counts end in Count, ISO 8601 timestamps end in At, human-readable dates end in Label, and arrays are plural nouns. Validated against a generated export by tests/apiexport.spec.mjs, so this file cannot drift from the code without a test failing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "version", "generatedAt", "generator", "counts", "questionnaires", "documents", "passages"],
+  "properties": {
+    "format": { "const": "serotonin.api" },
+    "version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+\\.[0-9]+$",
+      "description": "Semantic version of this format. A minor bump adds optional fields; a major bump would be a new $id and a new file."
+    },
+    "generatedAt": { "type": "string", "format": "date-time" },
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["app", "appVersion"],
+      "properties": {
+        "app": { "const": "serotonin" },
+        "appVersion": { "type": ["string", "null"] }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "description": "Totals, so a consumer can detect a truncated or partial file before processing it.",
+      "additionalProperties": false,
+      "required": [
+        "questionnaires", "completedQuestionnaires", "inProgressQuestionnaires",
+        "answers", "documents", "indexedDocuments", "passages", "passagesWithVectors"
+      ],
+      "properties": {
+        "questionnaires": { "type": "integer", "minimum": 0 },
+        "completedQuestionnaires": { "type": "integer", "minimum": 0 },
+        "inProgressQuestionnaires": { "type": "integer", "minimum": 0 },
+        "answers": { "type": "integer", "minimum": 0 },
+        "documents": { "type": "integer", "minimum": 0 },
+        "indexedDocuments": { "type": "integer", "minimum": 0 },
+        "passages": { "type": "integer", "minimum": 0 },
+        "passagesWithVectors": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "questionnaires": {
+      "type": "array",
+      "description": "Completed and in-flight questionnaires in one collection. In the backup format these were two collections whose `questions` field was a count in one and an array in the other; here the count is questionCount and the array is answers, in both.",
+      "items": { "$ref": "#/$defs/questionnaire" }
+    },
+    "documents": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/document" }
+    },
+    "passages": {
+      "type": "array",
+      "description": "Extracted document text and previous answers, already split on sentence boundaries with page numbers carried through. A consumer never needs to parse a PDF.",
+      "items": { "$ref": "#/$defs/passage" }
+    }
+  },
+
+  "$defs": {
+    "fileRef": {
+      "type": "object",
+      "description": "Where a file is, not the file itself. `scheme` tells a consumer whether it can be fetched: s3 references are reachable with credentials, device references exist only inside one browser's IndexedDB.",
+      "additionalProperties": false,
+      "required": ["scheme", "ref", "name", "contentType", "sizeBytes", "bytesIncluded"],
+      "properties": {
+        "scheme": { "enum": ["s3", "device", "none"] },
+        "ref": { "type": ["string", "null"] },
+        "name": { "type": ["string", "null"] },
+        "contentType": { "type": ["string", "null"] },
+        "sizeBytes": { "type": "integer", "minimum": 0 },
+        "bytesIncluded": {
+          "const": false,
+          "description": "Always false in this format. Use serotonin.backup if you need the bytes."
+        }
+      }
+    },
+
+    "answerSource": {
+      "type": ["object", "null"],
+      "description": "Which document or previous questionnaire this answer was drawn from, and when that source was added — which is what tells a reader whether it came from the current version of a policy.",
+      "additionalProperties": false,
+      "required": ["type", "id", "name", "page", "addedLabel", "addedAt"],
+      "properties": {
+        "type": { "enum": ["document", "questionnaire"] },
+        "id": { "type": ["string", "null"] },
+        "name": { "type": ["string", "null"] },
+        "page": { "type": ["integer", "null"], "minimum": 0 },
+        "addedLabel": { "type": ["string", "null"] },
+        "addedAt": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+
+    "answer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["position", "question", "answer", "status", "confidence", "citation", "source"],
+      "properties": {
+        "position": { "type": "integer", "minimum": 1 },
+        "question": { "type": "string" },
+        "answer": { "type": "string" },
+        "status": {
+          "type": "string",
+          "description": "auto-filled, flagged, needs-input and answered come from the app; answered is used for completed questionnaires, which did not retain a per-question status."
+        },
+        "confidence": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
+        "citation": { "type": ["string", "null"] },
+        "source": { "$ref": "#/$defs/answerSource" }
+      }
+    },
+
+    "attachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "file", "addedAt"],
+      "properties": {
+        "name": { "type": "string" },
+        "file": { "$ref": "#/$defs/fileRef" },
+        "addedAt": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+
+    "questionnaire": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "status", "vendor", "industry", "tags", "owner", "assignee", "step",
+        "questionCount", "answeredCount", "averageConfidence",
+        "completedLabel", "completedAt", "updatedAt", "answers", "attachments"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "status": { "enum": ["complete", "in_progress"] },
+        "vendor": { "type": "string" },
+        "industry": { "type": ["string", "null"] },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "owner": { "type": ["string", "null"] },
+        "assignee": { "type": ["string", "null"] },
+        "step": { "type": "string" },
+        "questionCount": { "type": "integer", "minimum": 0 },
+        "answeredCount": { "type": "integer", "minimum": 0 },
+        "averageConfidence": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
+        "completedLabel": { "type": ["string", "null"] },
+        "completedAt": { "type": ["string", "null"], "format": "date-time" },
+        "updatedAt": { "type": ["string", "null"], "format": "date-time" },
+        "answers": { "type": "array", "items": { "$ref": "#/$defs/answer" } },
+        "attachments": { "type": "array", "items": { "$ref": "#/$defs/attachment" } }
+      }
+    },
+
+    "document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "name", "category", "note", "tags",
+        "addedLabel", "addedAt", "origin", "file", "passageCount", "indexed"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "category": { "type": ["string", "null"] },
+        "note": { "type": ["string", "null"] },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "addedLabel": { "type": ["string", "null"] },
+        "addedAt": { "type": ["string", "null"], "format": "date-time" },
+        "origin": { "type": ["string", "null"] },
+        "file": { "$ref": "#/$defs/fileRef" },
+        "passageCount": { "type": "integer", "minimum": 0 },
+        "indexed": {
+          "type": "boolean",
+          "description": "False means the record exists but auto-review cannot see it — listed in the library, invisible to matching."
+        }
+      }
+    },
+
+    "embedding": {
+      "type": "object",
+      "description": "Vectors are present only when a cloud backend is attached. A device-only export reports model and dimensions with a null vector, because the on-device mirror strips vectors to stay inside the browser's storage quota.",
+      "additionalProperties": false,
+      "required": ["model", "dimensions", "vector"],
+      "properties": {
+        "model": { "type": ["string", "null"] },
+        "dimensions": { "type": "integer", "minimum": 0 },
+        "vector": {
+          "type": ["array", "null"],
+          "items": { "type": "number" }
+        }
+      }
+    },
+
+    "passage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "kind", "sourceType", "sourceId", "sourceName", "category",
+        "page", "position", "question", "text", "embedding", "indexedAt"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "kind": {
+          "enum": ["document", "answer"],
+          "description": "document is extracted text; answer is a previous answer, whose `question` is what matching compares against."
+        },
+        "sourceType": { "enum": ["document", "questionnaire"] },
+        "sourceId": { "type": "string" },
+        "sourceName": { "type": ["string", "null"] },
+        "category": { "type": ["string", "null"] },
+        "page": { "type": ["integer", "null"], "minimum": 0 },
+        "position": { "type": "integer", "minimum": 0 },
+        "question": { "type": ["string", "null"] },
+        "text": { "type": "string" },
+        "embedding": { "$ref": "#/$defs/embedding" },
+        "indexedAt": { "type": ["string", "null"], "format": "date-time" }
+      }
+    }
+  }
+}

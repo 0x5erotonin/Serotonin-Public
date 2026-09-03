@@ -1,0 +1,72 @@
+[
+  {
+    "name": "a failed write does not reach DynamoDB",
+    "passed": true,
+    "detail": "0 row(s)"
+  },
+  {
+    "name": "the record is kept on this device and flagged dirty",
+    "passed": true,
+    "detail": "mirror=1, dirty=1"
+  },
+  {
+    "name": "a successful read does not discard the unsaved record",
+    "passed": true,
+    "detail": "1 active assessment · 0 completed"
+  },
+  {
+    "name": "the queued write is retried and lands in DynamoDB",
+    "passed": true,
+    "detail": "1 row(s)"
+  },
+  {
+    "name": "the dirty flag clears once the retry succeeds",
+    "passed": true,
+    "detail": "{}"
+  },
+  {
+    "name": "a failed delete leaves a tombstone",
+    "passed": true,
+    "detail": "1 tombstone(s)"
+  },
+  {
+    "name": "the tombstoned record does not reappear after a reload",
+    "passed": true,
+    "detail": "0 notification(s) came back"
+  },
+  {
+    "name": "the failed delete is retried against DynamoDB",
+    "passed": true,
+    "detail": "0 row(s) still in the table"
+  },
+  {
+    "name": "the tombstone clears once the retry succeeds",
+    "passed": true,
+    "detail": "{}"
+  },
+  {
+    "name": "the racing draft exists locally before the delete",
+    "passed": true,
+    "detail": "[{\"id\":\"draft_1788359445789\",\"vendor\":\"Ephemeral Corp\"},{\"id\":\"draft_1788359425615\",\"vendor\":\"Ironclad Systems\"}]"
+  },
+  {
+    "name": "the deleted questionnaire is not recreated by the in-flight save",
+    "passed": true,
+    "detail": "table holds: Ironclad Systems"
+  },
+  {
+    "name": "and it does not reappear in the UI",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "its KB entry was still created",
+    "passed": true,
+    "detail": "Ephemeral Corp"
+  },
+  {
+    "name": "no page errors throughout",
+    "passed": true,
+    "detail": ""
+  }
+]

@@ -636,6 +636,38 @@ about their cost:
   other side. No infrastructure, no exposure, and it works today — but it is a
   manual copy, and two people will diverge the moment they both edit.
 
+#### Option 3d — one library for everyone with the URL
+
+If what you want is literally *"anyone who opens this link sees everything"* —
+a demo, a portfolio piece, a shared scratch library — that is a build-time
+switch rather than a code change. In the Amplify console, **App settings →
+Environment variables**:
+
+    VITE_SHARED_LIBRARY = 1
+
+Redeploy. Records are then filed under one fixed owner key and files under one
+shared S3 prefix, so every browser reads and writes the same library. Records
+written before the switch are re-keyed automatically on first load, so nothing
+disappears. The app says it is in shared mode on every screen and in the
+Storage & Security panel — that is deliberate and not worth removing.
+
+The value is parsed fail-closed: `1`, `true`, `yes`, `on` and `shared` turn it
+on, anything else leaves the library private, and an unrecognised value is
+reported in the panel rather than silently ignored. A typo must not be the
+reason a compliance library becomes public.
+
+> ⚠️ **This is public, not "shared with my team".** With no sign-in enforced
+> there is nothing to tell a colleague from a stranger, and a deployed Amplify
+> URL is not a secret — it is in browser history, in referrer headers, and in
+> anything that follows a link. Fine for invented demo data. Not fine for a real
+> SOC 2 report, a real pen test report, or a completed customer questionnaire.
+> For a genuine team library, do 2 and 3b instead.
+>
+> Note also what this does *not* change: the AppSync and S3 rules already grant
+> every guest read across the whole guest prefix, so the per-browser separation
+> you have today is client-side filtering, not enforcement. Shared mode makes
+> the sharing honest rather than newly possible.
+
 #### Recommended path
 
 2 → 3b → 4 → 5, with 6's shared owner key only if something has to be

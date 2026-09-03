@@ -27,7 +27,7 @@ Then it happens again next month. And the month after that.
 
 **📊 It handles the spreadsheets** — A SIG or CAIQ workbook is a cover page, an instructions tab, a glossary, the questionnaire, and usually an old version nobody deleted. Serotonin works out which sheet is the questionnaire and which column holds the questions — they're rarely in column A — skips the rest, and tells you exactly what it picked: *"used column C ("Question") of "Full Questionnaire" — skipped "Instructions" (looks like guidance), "Glossary" (looks like a glossary)"*.
 
-**📥 Bulk import and export** — Drop thirty policies at once, or a .zip of them; each file's category is guessed from its name and editable before it lands, one bad file is reported rather than taking the batch down, and progress is per file. Export the whole library as a restorable JSON backup, or the answer history and document manifest as CSV.
+**📥 Bulk import and export** — Drop thirty policies at once, or a .zip of them; each file's category is guessed from its name and editable before it lands, one bad file is reported rather than taking the batch down, and progress is per file. Export the whole library as a restorable JSON backup, the answer history and document manifest as CSV, or a defined [`serotonin.api` v1](docs/INTEGRATION_EXPORT.md) shape for feeding another system — documents already parsed into passages, files as references, schema enforced by tests.
 
 **🧠 Knowledge base** — Every questionnaire you complete gets indexed and searchable, and so does every policy document you import: SOC 2 reports, access control policies, disaster recovery plans are split into passages, embedded, and cited by page. One library, one search — completed questionnaires and imported documents sit side by side under *All entries*, and documents can be renamed in place without re-uploading or re-indexing. Genuinely gets better with every questionnaire you run through it, because your own answers become the best match for next time.
 
@@ -206,6 +206,8 @@ Serotonin-public/
 ├── customHttp.yml              ← security headers
 ├── AMPLIFY_SETUP.md            ← deployment + the auth to-do list
 ├── docs/BACKEND_OPTIONS.md     ← alternatives to Amplify, and what a swap would cost
+├── docs/INTEGRATION_EXPORT.md  ← the serotonin.api v1 export shape
+├── docs/serotonin.api.v1.schema.json  ← its schema, enforced by tests
 ├── AUTO_REVIEW.md              ← how parsing, scoring and citation work
 ├── index.html
 └── package.json

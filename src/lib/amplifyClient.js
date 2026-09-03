@@ -15,9 +15,29 @@
  * simply queues behind initialisation.
  */
 
+import { readLibraryMode, SHARED_OWNER_KEY } from './libraryMode.js';
+
 const outputsModules = import.meta.glob('/amplify_outputs*.json', { eager: true });
 const outputsEntry = Object.values(outputsModules)[0];
 const outputs = outputsEntry?.default ?? outputsEntry ?? null;
+
+/**
+ * Private or shared, decided at build time from VITE_SHARED_LIBRARY.
+ *
+ * Read once here rather than at every call site, so there is exactly one place
+ * that decides and one thing to check when asking "is this deployment shared?".
+ */
+const libraryMode = readLibraryMode(import.meta.env || {});
+
+/** True when this build serves one library to everyone who opens the URL. */
+export function isSharedLibrary() {
+  return libraryMode.shared;
+}
+
+/** For the UI to report a misconfigured value rather than silently ignoring it. */
+export function libraryModeSetting() {
+  return { ...libraryMode };
+}
 
 /** Set once initialisation settles. Read it through `whenReady()`. */
 let configured = false;
@@ -92,6 +112,22 @@ export async function getOwnerKey() {
 }
 
 async function resolveOwnerKey() {
+  // Shared mode short-circuits identity entirely: one key, everyone. Applied
+  // before the backend check so the device-only path behaves the same way —
+  // otherwise turning the flag on would appear to work locally and change
+  // nothing once deployed, or the reverse.
+  if (libraryMode.shared) {
+    // `signedIn` still needs resolving, because the S3 prefix depends on it.
+    if (await ready) {
+      try {
+        const { fetchAuthSession } = await import('aws-amplify/auth');
+        const session = await fetchAuthSession();
+        signedIn = !!session?.tokens?.idToken;
+      } catch { /* guest; the default is already false */ }
+    }
+    return SHARED_OWNER_KEY;
+  }
+
   if (!(await ready)) return localOwnerKey();
   const { fetchAuthSession } = await import('aws-amplify/auth');
   const session = await fetchAuthSession();

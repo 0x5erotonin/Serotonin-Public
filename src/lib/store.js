@@ -35,7 +35,8 @@
  * ────────────────────────────────────────────────────────────────────────────
  */
 
-import { getDataClient, getOwnerKey } from './amplifyClient.js';
+import { getDataClient, getOwnerKey, isSharedLibrary } from './amplifyClient.js';
+import { SHARED_OWNER_KEY, SHARED_REKEY_KEY } from './libraryMode.js';
 import { COLLECTIONS, PROFILE_COLLECTION, asId } from './collections.js';
 
 const MIRROR_PREFIX = 'serotonin.v2.';
@@ -686,13 +687,19 @@ const migrationWatchers = new Set();
 export function ensureDeviceMigration({ onProgress } = {}) {
   if (onProgress) migrationWatchers.add(onProgress);
   if (!migrationPromise) {
-    migrationPromise = migrateDeviceToCloud({
-      onProgress: (update) => {
-        for (const watcher of migrationWatchers) {
-          try { watcher(update); } catch { /* a broken listener must not stop the migration */ }
-        }
-      },
-    }).catch((err) => {
+    const emit = (update) => {
+      for (const watcher of migrationWatchers) {
+        try { watcher(update); } catch { /* a broken listener must not stop the migration */ }
+      }
+    };
+    migrationPromise = migrateDeviceToCloud({ onProgress: emit })
+      .then(async (result) => {
+        // Re-keying runs after the upload and inside the same gate, so it
+        // happens before any read can overwrite the mirror.
+        const rekeyed = await rekeyToSharedLibrary(emit);
+        return rekeyed > 0 ? { ...result, ran: true, records: result.records + rekeyed, rekeyed } : result;
+      })
+      .catch((err) => {
       console.warn('[serotonin] Device-to-cloud migration failed.', err);
       return { ran: true, records: 0, files: 0, warnings: [String(err?.message || err)] };
     });
@@ -843,6 +850,62 @@ async function migrateDeviceFiles(onProgress) {
     }
   }
   return out;
+}
+
+/**
+ * Bring records written before shared mode was switched on into the shared key.
+ *
+ * Every query filters on `ownerKey`. Turning on VITE_SHARED_LIBRARY changes what
+ * that key is, so records written under the old per-identity key stop matching
+ * and the library looks empty — which is indistinguishable, from the outside,
+ * from the data having been deleted. It has not been; it is just filed under a
+ * name nothing asks for any more.
+ *
+ * `putRecord` always writes with the *current* owner key and updates in place by
+ * id, so re-saving each mirrored record re-files it under the shared key without
+ * duplicating anything or leaving an orphan behind.
+ *
+ * Runs once per device, and only in shared mode.
+ *
+ * @returns how many records were re-keyed
+ */
+async function rekeyToSharedLibrary(onProgress = () => {}) {
+  if (!isSharedLibrary()) return 0;
+  if (readJson(SHARED_REKEY_KEY, false) === true) return 0;
+
+  const client = await getDataClient();
+  if (!client) {
+    // Device-only: the mirror is not keyed by owner, so there is nothing to
+    // re-file. Mark it done so the first cloud load does not repeat the check.
+    writeJson(SHARED_REKEY_KEY, true);
+    return 0;
+  }
+
+  let moved = 0;
+  try {
+    for (const name of Object.keys(COLLECTIONS)) {
+      const local = readMirror(name, []);
+      if (local.length === 0) continue;
+
+      // Anything already under the shared key needs nothing doing.
+      const remoteIds = await listRemoteIds(client, name);
+      const stragglers = local.filter((record) => !remoteIds.has(asId(record.id)));
+      if (stragglers.length === 0) continue;
+
+      onProgress({ stage: 'sharing', detail: name, done: 0, total: stragglers.length });
+      for (const record of stragglers) {
+        await putRecord(name, record);
+        moved += 1;
+      }
+      markSynced(name);
+    }
+    writeJson(SHARED_REKEY_KEY, true);
+  } catch (err) {
+    // Not marked done, so it retries on the next load rather than leaving
+    // records stranded under a key nothing queries.
+    console.warn('[serotonin] Could not re-key records into the shared library.', err);
+  }
+  return moved;
 }
 
 /* ── Export / import ──────────────────────────────────────────────────────── */

@@ -1,7 +1,187 @@
 [
   {
-    "name": "test run completed without throwing",
-    "passed": false,
-    "detail": "page.click: Timeout 30000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('button:has-text(\"Import 1 document\")')\u001b[22m\n"
+    "name": "importing a document indexes it into searchable passages",
+    "passed": true,
+    "detail": "4 passage(s)"
+  },
+  {
+    "name": "passages carry their source document name",
+    "passed": true,
+    "detail": "access-control-standard-2026.txt | information-security-policy.txt"
+  },
+  {
+    "name": "the document is marked searchable in the library",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "completing a questionnaire indexes its answers for reuse",
+    "passed": true,
+    "detail": "2 Q&A passage(s)"
+  },
+  {
+    "name": "Q&A passages keep the question and the answer separately",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "the PDF was parsed and questions were found",
+    "passed": true,
+    "detail": "no notice line"
+  },
+  {
+    "name": "six questions extracted from the PDF, page furniture excluded",
+    "passed": true,
+    "detail": "6: Do you require multi-factor  | Describe your process for pr | Is data encrypted at rest an | How often is your disaster r | Do you perform background ch | What is the airspeed velocit"
+  },
+  {
+    "name": "the vendor and CONFIDENTIAL header lines were not treated as questions",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "section headings were not treated as questions",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "a question answered before is auto-filled from history",
+    "passed": true,
+    "detail": "auto-filled @ 95% — \"Yes. MFA via hardware tokens or TOTP is \""
+  },
+  {
+    "name": "the auto-filled answer is attributed to the questionnaire it came from",
+    "passed": true,
+    "detail": "Previously answered — Globex · Aug 31, 2026"
+  },
+  {
+    "name": "the auto-filled answer records the source it was pulled from",
+    "passed": true,
+    "detail": "Globex · Aug 31, 2026"
+  },
+  {
+    "name": "the auto-filled answer carries the source date",
+    "passed": true,
+    "detail": "sourceDate=\"Aug 31, 2026\""
+  },
+  {
+    "name": "alternatives are kept out of the stored record",
+    "passed": true,
+    "detail": "0 stored on a record that must stay under 400 KB"
+  },
+  {
+    "name": "the review screen offers to change the source",
+    "passed": true,
+    "detail": "2 question(s) offer a source picker"
+  },
+  {
+    "name": "the picker lists sources to choose from",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "each listed source shows when it was added",
+    "passed": true,
+    "detail": "added Aug 31, 2026"
+  },
+  {
+    "name": "the source in use is marked as such",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "a listed source can be applied",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "the source name is shown on screen, not just held in state",
+    "passed": true,
+    "detail": "Globex · Aug 31, 2026"
+  },
+  {
+    "name": "no cited passage opens with a lowercase word fragment",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "a question covered by a policy document is flagged, not auto-filled",
+    "passed": true,
+    "detail": "flagged @ 93% answer=\"\""
+  },
+  {
+    "name": "the document match cites the source document",
+    "passed": true,
+    "detail": "information-security-policy.txt"
+  },
+  {
+    "name": "the cited passage is the encryption paragraph",
+    "passed": true,
+    "detail": "Information Security Policy Section 4 — Cryptography All cus"
+  },
+  {
+    "name": "the DR question finds the resilience passage",
+    "passed": true,
+    "detail": "flagged — Access to key material is restricted to the securi"
+  },
+  {
+    "name": "an unanswerable question is marked for a manual answer",
+    "passed": true,
+    "detail": "needs-input @ 0%"
+  },
+  {
+    "name": "the manual case explains why nothing matched",
+    "passed": true,
+    "detail": "No related material in the knowledge base. Keyword matching only — semantic matching is unavailable, so paraphrased matches may have been missed."
+  },
+  {
+    "name": "suggestions render with the source and an accept button",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "the match is explained to the analyst",
+    "passed": true,
+    "detail": "Rec: Draft from the cited passage — matched on data, encryption, at rest, in transit."
+  },
+  {
+    "name": "accepting a suggestion writes it into the answer",
+    "passed": true,
+    "detail": "3 answered of 6"
+  },
+  {
+    "name": "the reviewed questionnaire survives a refresh with its statuses",
+    "passed": true,
+    "detail": "6 questions"
+  },
+  {
+    "name": "a corrupt .xlsx says what is actually wrong with it",
+    "passed": true,
+    "detail": "Could not read questionnaire.xlsx: Not a ZIP archive (no end-of-central-directory record found)."
+  },
+  {
+    "name": "a legacy .xls upload says to re-save as .xlsx",
+    "passed": true,
+    "detail": "Legacy .xls files use a binary format that predates the readable one. Open it in Excel and save as .xlsx."
+  },
+  {
+    "name": "a SIG-shaped workbook yields its questions",
+    "passed": true,
+    "detail": "10 question(s)"
+  },
+  {
+    "name": "the question column was used, not the reference or domain columns",
+    "passed": true,
+    "detail": "Do you require multi-fac | Describe your process fo | Is access reviewed on a "
+  },
+  {
+    "name": "a file with no questions says so rather than proceeding with nothing",
+    "passed": true,
+    "detail": "No questions found in empty.txt. It scanned 2 lines. If the questions are in a table, try uploading the spreadsheet itself, or paste them in manually."
+  },
+  {
+    "name": "no page errors throughout",
+    "passed": true,
+    "detail": ""
   }
 ]

@@ -17,7 +17,8 @@
  * an <a href> or <img src> can use.
  */
 
-import { getIdentityId, getOwnerKey, isSignedIn } from './amplifyClient.js';
+import { getIdentityId, getOwnerKey, isSignedIn, isSharedLibrary } from './amplifyClient.js';
+import { SHARED_FILE_PREFIX } from './libraryMode.js';
 
 const IDB_SCHEME = 'idb://';
 const DB_NAME = 'serotonin-files';
@@ -79,6 +80,11 @@ async function resolvePrefix(identityId) {
   // record read cannot mistake a signed-in user for a guest and drop their file
   // into the unenforced prefix.
   await getOwnerKey();
+  // One prefix for everyone, so a file uploaded from one browser opens in
+  // another. Existing objects under guest-files/ keep working untouched: that
+  // rule already grants every guest read across the whole prefix, so nothing
+  // has to be moved when the mode changes.
+  if (isSharedLibrary()) return SHARED_FILE_PREFIX;
   return isSignedIn() ? `user-files/${identityId}/` : `guest-files/${identityId}/`;
 }
 

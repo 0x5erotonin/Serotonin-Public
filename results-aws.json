@@ -1,0 +1,122 @@
+[
+  {
+    "name": "Amplify.configure ran with the generated outputs",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "data client generated with identityPool auth mode",
+    "passed": true,
+    "detail": "authMode=identityPool"
+  },
+  {
+    "name": "reads go through AppSync, scoped by ownerKey",
+    "passed": true,
+    "detail": "8 list call(s), ownerKey=us-east-1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+  },
+  {
+    "name": "guest identity ID used as the owner key",
+    "passed": true,
+    "detail": "us-east-1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+  },
+  {
+    "name": "every collection is loaded on boot",
+    "passed": true,
+    "detail": "Notification, Questionnaire, KbEntry, KbDocument"
+  },
+  {
+    "name": "notification feed seeded into DynamoDB",
+    "passed": true,
+    "detail": "8 rows"
+  },
+  {
+    "name": "questionnaire row created",
+    "passed": true,
+    "detail": "1 row(s), vendor=Northwind Traders"
+  },
+  {
+    "name": "row carries ownerKey, questions JSON and derived counts",
+    "passed": true,
+    "detail": "questionCount=2, questions=2"
+  },
+  {
+    "name": "UI `owner` maps to the model's ownerName, avoiding the reserved field",
+    "passed": true,
+    "detail": "ownerKey, ownerName, ownerInitials"
+  },
+  {
+    "name": "autosave upserts one row instead of creating duplicates",
+    "passed": true,
+    "detail": "1 row(s)"
+  },
+  {
+    "name": "upsert path uses get-then-update",
+    "passed": true,
+    "detail": "updates=10, creates=1"
+  },
+  {
+    "name": "data comes back from the API with the mirror cleared",
+    "passed": true,
+    "detail": "1 active assessment · 0 completed"
+  },
+  {
+    "name": "document row created with its S3 key",
+    "passed": true,
+    "detail": "storagePath=guest-files/us-east-1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/kb-documents/mtk70e7q-k3kkrx-dr-plan-v3.pdf"
+  },
+  {
+    "name": "guest uploads land under the identity-scoped guest prefix",
+    "passed": true,
+    "detail": "guest-files/us-east-1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/kb-documents/mtk70e7q-k3kkrx-dr-plan-v3.pdf"
+  },
+  {
+    "name": "file bytes actually reached S3",
+    "passed": true,
+    "detail": "2071 bytes, application/pdf"
+  },
+  {
+    "name": "document still listed after a reload",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "download resolves a fresh signed URL for the stored key",
+    "passed": true,
+    "detail": "getUrl(guest-files/us-east-1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/kb-documents/mtk70e7q-k3kkrx-dr-plan-v3.pdf)"
+  },
+  {
+    "name": "download click completes without error",
+    "passed": true,
+    "detail": "handed off via the anchor fallback"
+  },
+  {
+    "name": "delete removes the DynamoDB row",
+    "passed": true,
+    "detail": "0 row(s) left"
+  },
+  {
+    "name": "delete also removes the S3 object (no orphans)",
+    "passed": true,
+    "detail": "bucket empty"
+  },
+  {
+    "name": "audit log records the actions taken",
+    "passed": true,
+    "detail": "6 entries: questionnaire.save, document.import, storage.migrate, document.delete"
+  },
+  {
+    "name": "profile written to UserProfile, keyed by owner",
+    "passed": true,
+    "detail": "name=Blayqe Forbes, id===ownerKey=true"
+  },
+  {
+    "name": "no page errors on the AWS path",
+    "passed": true,
+    "detail": ""
+  },
+  {
+    "name": "no failed network requests",
+    "passed": true,
+    "detail": ""
+  }
+]

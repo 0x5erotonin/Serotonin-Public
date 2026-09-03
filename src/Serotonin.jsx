@@ -11,17 +11,18 @@ import {
 
 import { usePersistentList, usePersistentProfile, useLocalValue } from './lib/usePersisted.js';
 import {
-  migrateLegacySessionState, recordAudit, deleteWhere,
+  migrateLegacySessionState, recordAudit, deleteWhere, listAll,
   ensureDeviceMigration, exportEverything, importEverything,
 } from './lib/store.js';
 import { uploadFile, removeFile, openFile, getFileUrl, formatBytes } from './lib/files.js';
-import { isAmplifyConfigured, whenReady } from './lib/amplifyClient.js';
+import { isAmplifyConfigured, whenReady, isSharedLibrary, libraryModeSetting } from './lib/amplifyClient.js';
 import { extractText, SUPPORTED_LABEL } from './lib/extract.js';
 import { normaliseDocName } from './lib/docName.js';
 import { openZip } from './lib/unzip.js';
 import {
   DOC_CATEGORIES, guessDocCategory, answerHistoryCsv, documentManifestCsv, exportFilename,
 } from './lib/exportFormats.js';
+import { toApiExport } from './lib/apiExport.js';
 import { extractQuestions, questionsFromLines } from './lib/questionExtract.js';
 import { questionsFromSheets, describeReport } from './lib/gridQuestions.js';
 import { autoReview } from './lib/matcher.js';
@@ -31,6 +32,7 @@ import {
 } from './lib/kbIndex.js';
 
 // Serotonin v2.0
+const APP_VERSION = '2.1.0';
 // Created and Owned by Blayqe Forbes
 // Copyright © 2025 Blayqe Forbes. All Rights Reserved.
 
@@ -2210,7 +2212,7 @@ function BatchProcessing({ t, s }) {
 
 // ─── KNOWLEDGE BASE ───────────────────────────────────────────────────────────
 
-function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDoc, onRenameDoc, onDeleteEntry, onIndexChanged }) {
+function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], drafts = [], onAddDoc, onRemoveDoc, onRenameDoc, onDeleteEntry, onIndexChanged }) {
   const [view,          setView]          = useState('library');
   const [viewMode,      setViewMode]      = useState('grid');
   const [search,        setSearch]        = useState('');
@@ -2279,6 +2281,31 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
           'text/csv;charset=utf-8',
         );
         setBackupNote({ kind: 'done', message: `Exported ${kbDocs.length} document${kbDocs.length !== 1 ? 's' : ''}.` });
+        return;
+      }
+
+      if (kind === 'api') {
+        // The integration shape. Built from the same records, with the field
+        // names an outside consumer can rely on and files as references rather
+        // than inlined bytes — described by docs/serotonin.api.v1.schema.json.
+        setBackupNote({ kind: 'info', message: 'Loading the search index…' });
+        const indexRows = chunks.length > 0 ? chunks : await loadChunks();
+        const bundle = toApiExport({
+          entries: kbEntries,
+          drafts,
+          docs: kbDocs,
+          chunks: withCurrentSources(indexRows, { docs: kbDocs, entries: kbEntries }),
+          attachments: await listAll('attachments').catch(() => []),
+          appVersion: APP_VERSION,
+        });
+        download(JSON.stringify(bundle, null, 2), exportFilename('api-export', 'json'), 'application/json');
+        setBackupNote({
+          kind: 'done',
+          message: `Exported ${bundle.counts.questionnaires} questionnaire${bundle.counts.questionnaires !== 1 ? 's' : ''}, ${bundle.counts.documents} document${bundle.counts.documents !== 1 ? 's' : ''} and ${bundle.counts.passages} parsed passage${bundle.counts.passages !== 1 ? 's' : ''}.`
+            + (bundle.counts.passagesWithVectors === 0 && bundle.counts.passages > 0
+              ? ' Embedding vectors are omitted — they exist only when a cloud backend is attached.'
+              : ''),
+        });
         return;
       }
 
@@ -2652,10 +2679,45 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
             </div>
             {/* Describes what is actually running, which depends on whether an
                 Amplify backend is attached to this build. */}
+            {/*
+              Shared mode changes who can read everything in this app, so it is
+              stated before the storage details rather than buried in them. An
+              app that is quietly public is worse than one that is loudly public.
+            */}
+            {isSharedLibrary() && (
+              <div style={{ background: t.warnBg, border: `0.5px solid ${t.warn}`, borderRadius: 7, padding: '12px 14px', marginBottom: 14 }}>
+                <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+                  <AlertTriangle size={14} color={t.warn} style={{ flexShrink: 0, marginTop: 1 }} />
+                  <div>
+                    <div style={{ fontFamily: t.sansFont, fontSize: 12, fontWeight: 600, color: t.warnText, marginBottom: 4 }}>
+                      Shared library — everyone with this URL sees and edits this data
+                    </div>
+                    <div style={{ fontFamily: t.sansFont, fontSize: 11, color: t.text3, lineHeight: 1.5 }}>
+                      This deployment was built with <code style={{ fontFamily: t.monoFont }}>VITE_SHARED_LIBRARY</code> on, so
+                      records and files are filed under one shared key instead of per browser. There is no sign-in, so
+                      "everyone with the URL" means anyone who has it — not just your team. Use demo data here, not real
+                      customer questionnaires.
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+            {!isSharedLibrary() && libraryModeSetting().raw && !libraryModeSetting().recognised && (
+              <div style={{ background: t.dangerBg, border: `0.5px solid ${t.danger}`, borderRadius: 7, padding: '12px 14px', marginBottom: 14 }}>
+                <div style={{ fontFamily: t.sansFont, fontSize: 12, color: t.dangerText, lineHeight: 1.5 }}>
+                  <strong>VITE_SHARED_LIBRARY is set to "{libraryModeSetting().raw}", which is not a value this build understands.</strong>{' '}
+                  The library is private, which is the safe default. Use 1, true, yes or on to share it.
+                </div>
+              </div>
+            )}
             {(amplifyOn
               ? [
-                  ['Primary', 'AWS DynamoDB via AppSync. Encrypted at rest, point-in-time recovery available.'],
-                  ['Files', 'Amazon S3. Encrypted at rest, served through short-lived signed URLs.'],
+                  ['Primary', isSharedLibrary()
+                    ? 'AWS DynamoDB via AppSync, one shared library for every visitor. Encrypted at rest.'
+                    : 'AWS DynamoDB via AppSync. Encrypted at rest, point-in-time recovery available.'],
+                  ['Files', isSharedLibrary()
+                    ? 'Amazon S3 under a single shared prefix, readable by every visitor. Encrypted at rest.'
+                    : 'Amazon S3. Encrypted at rest, served through short-lived signed URLs.'],
                   ['Search', 'Client-side over your own records — nothing leaves the browser to be indexed.'],
                   ['Offline', 'Every read is mirrored on this device, so a dropped connection still renders your data.'],
                 ]
@@ -3411,6 +3473,12 @@ function KnowledgeBase({ t, s, kbEntries = [], kbDocs = [], onAddDoc, onRemoveDo
                 stat: `${kbEntries.reduce((sum, e) => sum + (e.qaData || []).length, 0)} answer${kbEntries.reduce((sum, e) => sum + (e.qaData || []).length, 0) !== 1 ? 's' : ''}`,
               },
               {
+                id: 'api',
+                title: 'Integration export (JSON)',
+                detail: 'A defined, versioned shape for feeding another system: structured answers, and every document already parsed into passages. Files are references, not bytes. Described by docs/serotonin.api.v1.schema.json.',
+                stat: 'serotonin.api v1',
+              },
+              {
                 id: 'documents',
                 title: 'Document manifest (CSV)',
                 detail: 'What is in the library, its category and date, and whether auto-review can actually see it.',
@@ -3878,10 +3946,16 @@ Knowledge base → Export. Three options:
 - **Full backup (JSON)** — every record and every stored file, inline. The only one that can be restored.
 - **Answer history (CSV)** — every question and answer from every completed questionnaire, one row each. Opens in Excel; useful for review, bulk editing, or handing to someone without the app.
 - **Document manifest (CSV)** — what is in the library, its category and date, and whether auto-review can actually see it.
+- **Integration export (JSON)** — a defined, versioned shape for feeding another system: structured answers, every document already split into passages, and files as references rather than bytes. It has a published schema (docs/serotonin.api.v1.schema.json) that the tests enforce, so anything built against it will not break silently.
 
 Restore is on the same screen and is additive: a record already present is skipped, never replaced, so restoring an older backup cannot roll the library back. Worth exporting before any change to where data lives — a new domain, a backend going live, or clearing your browser.
 
 With no backend attached your library exists in this browser and nowhere else. Clearing site data, switching browsers, or moving the app to a different domain all leave it behind.
+
+**How do I let everyone with the link see the same library?**
+Set VITE_SHARED_LIBRARY = 1 in the Amplify console under App settings → Environment variables, and redeploy. Every browser then reads and writes one shared library instead of its own, and anything you saved before the switch is re-filed automatically rather than disappearing.
+
+Two things to be clear about before you do it. It only works once an AWS backend is actually attached — with device-only storage there is no server for a second person to read from, so nothing can be shared. And it means *anyone* with the URL, not just your team: there is no sign-in, and a deployed link is not a secret. Use it for demo data, not for real customer questionnaires. The app shows a banner on every screen while it is on.
 
 **Someone else on my team can't see my documents**
 Expected, for now. Sign-in is provisioned but not enforced, so every browser gets its own identity and records are scoped to whoever created them. Nothing is shared between people yet, on any network. AMPLIFY_SETUP.md has the options for changing that.`,
@@ -5915,6 +5989,17 @@ export default function Serotonin() {
 
         {/* Main content */}
         <main style={{ flex: 1, overflowY: 'auto', padding: '32px 36px 80px', scrollBehavior: 'smooth' }}>
+          {/* Shared mode is a property of the whole deployment, so it is stated
+              on every screen rather than only where storage is discussed. */}
+          {isSharedLibrary() && (
+            <div style={{ maxWidth: 900, margin: '0 auto 16px', display: 'flex', alignItems: 'center', gap: 8, background: t.warnBg, border: `0.5px solid ${t.warn}`, borderRadius: 8, padding: '8px 14px' }}>
+              <AlertTriangle size={12} color={t.warn} style={{ flexShrink: 0 }} />
+              <span style={{ fontFamily: t.sansFont, fontSize: 11, color: t.warnText }}>
+                Shared library — anyone with this URL sees and can edit everything here. No sign-in is required.
+              </span>
+            </div>
+          )}
+
           {/* One-time device → cloud migration. Loud on purpose: it is the only
               moment where data moves between two stores, and silence here is
               how people find out too late that something did not make it. */}
@@ -5955,7 +6040,7 @@ export default function Serotonin() {
           {module === 'editor'    && <QuestionnaireEditor t={t} s={s} onBack={() => { setResumeDraftId(null); setModule('dashboard'); }} onAddToKb={addKbEntry} drafts={drafts} kbDocs={kbDocs} kbEntries={kbEntries} knowledgeSignature={knowledgeSignature} onSaveDraft={saveDraft} onDeleteDraft={deleteDraft} profile={profile} resumeDraftId={resumeDraftId} onClearResume={() => setResumeDraftId(null)} onReleaseAttachments={releaseAttachments} />}
           {module === 'vendor'    && <VendorDashboard t={t} s={s} />}
           {module === 'batch'     && <BatchProcessing t={t} s={s} />}
-          {module === 'knowledge' && <KnowledgeBase t={t} s={s} kbEntries={kbEntries} kbDocs={kbDocs} onAddDoc={addKbDoc} onRemoveDoc={removeKbDoc} onRenameDoc={renameKbDoc} onDeleteEntry={deleteKbEntry} onIndexChanged={() => setIndexBump(n => n + 1)} />}
+          {module === 'knowledge' && <KnowledgeBase t={t} s={s} kbEntries={kbEntries} kbDocs={kbDocs} drafts={drafts} onAddDoc={addKbDoc} onRemoveDoc={removeKbDoc} onRenameDoc={renameKbDoc} onDeleteEntry={deleteKbEntry} onIndexChanged={() => setIndexBump(n => n + 1)} />}
           {module === 'wiki'      && <InternalWiki t={t} s={s} onNavigate={setModule} />}
         </main>
       </div>
